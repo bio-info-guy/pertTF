@@ -48,7 +48,6 @@ def train(model: nn.Module,
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     model.train()
     total_loss, total_mse, total_gepc = 0.0, 0.0, 0.0
     total_mse_next, total_gepc_next = 0.0, 0.0
@@ -336,7 +335,7 @@ def evaluate(model: nn.Module,
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
+    
     model.eval()
     total_loss = 0.0
     total_loss_next = 0.0
@@ -841,6 +840,7 @@ def wrapper_train(model, config, data_gen,
                 optimizer_dict,
                 epoch = epoch,
                 logger = logger,
+                device = device
             )
         val_loss, val_loss_next, val_mre, val_mre_next, val_dab, val_cls, val_pert = evaluate(
             model,
@@ -848,6 +848,7 @@ def wrapper_train(model, config, data_gen,
             config=config,
             vocab = vocab,
             epoch = epoch,
+            device = device
         )
         elapsed = time.time() - epoch_start_time
         if logger is not None:
