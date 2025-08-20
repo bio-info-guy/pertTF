@@ -9,8 +9,6 @@ from typing_extensions import Self
 import numpy as np
 import pandas as pd
 import torch
-import torchtext.vocab as torch_vocab
-from torchtext.vocab import Vocab
 
 # from transformers.tokenization_utils import PreTrainedTokenizer
 # from transformers import AutoTokenizer, BertTokenizer
@@ -141,11 +139,11 @@ def tokenize_batch(
 def pad_batch(
     batch: List[Tuple],
     max_len: int,
-    vocab: Vocab,
+    vocab: SimpleVocab,
     pad_token: str = "<pad>",
     pad_value: int = 0,
     cls_appended: bool = True,
-    vocab_mod: Vocab = None,
+    vocab_mod: SimpleVocab = None,
     sample_indices: List[np.ndarray] = None,
 ) -> Tuple[Dict[str, torch.Tensor], List[np.ndarray]]:
     """
@@ -250,7 +248,7 @@ def tokenize_and_pad_batch(
     data: np.ndarray,
     gene_ids: np.ndarray,
     max_len: int,
-    vocab: Vocab,
+    vocab: SimpleVocab,
     pad_token: str,
     pad_value: int,
     append_cls: bool = True,
@@ -258,7 +256,7 @@ def tokenize_and_pad_batch(
     cls_token: str = "<cls>",
     return_pt: bool = True,
     mod_type: np.ndarray = None,
-    vocab_mod: Vocab = None,
+    vocab_mod: SimpleVocab = None,
     sample_indices: List[np.ndarray] = None,
 ) -> Tuple[Dict[str, torch.Tensor], List[np.ndarray]]:
     """
