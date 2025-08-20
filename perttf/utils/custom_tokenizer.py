@@ -14,6 +14,63 @@ from torchtext.vocab import Vocab
 
 # from transformers.tokenization_utils import PreTrainedTokenizer
 # from transformers import AutoTokenizer, BertTokenizer
+import collections
+
+class SimpleVocab:
+    """
+    A simple, dependency-free vocabulary class to replace torchtext.vocab.Vocab.
+    It handles string-to-index (stoi) and index-to-string (itos) mappings.
+    """
+    def __init__(self, tokens: list, special_tokens: list = None):
+        """
+        Args:
+            tokens (list): A list of tokens (e.g., gene names) to build the vocabulary from.
+            special_tokens (list, optional): A list of special tokens like '<pad>' or '<cls>'.
+                                              These will be added to the beginning of the vocabulary.
+        """
+        self.special_tokens = special_tokens if special_tokens else []
+        
+        # Combine special tokens and unique regular tokens
+        all_tokens = self.special_tokens + sorted(list(set(tokens)))
+        
+        # Create integer-to-string mapping
+        self.itos = all_tokens
+        
+        # Create string-to-integer mapping
+        self.stoi = {token: i for i, token in enumerate(self.itos)}
+        
+        # Set a default index for out-of-vocabulary tokens
+        self._default_index = -1 # Uninitialized
+        if "<pad>" in self.stoi:
+            self.set_default_index(self.stoi["<pad>"])
+        elif "<unk>" in self.stoi:
+            self.set_default_index(self.stoi["<unk>"])
+
+    def __len__(self):
+        """Returns the size of the vocabulary."""
+        return len(self.itos)
+
+    def __getitem__(self, token: str) -> int:
+        """Allows dictionary-style lookup (e.g., vocab['<pad>'])."""
+        return self.stoi.get(token, self._default_index)
+
+    def __call__(self, tokens: list) -> list:
+        """Allows callable lookup for a list of tokens (e.g., vocab(gene_list))."""
+        return [self[token] for token in tokens]
+
+    def set_default_index(self, index: int):
+        """Sets the index to return for out-of-vocabulary tokens."""
+        if not 0 <= index < len(self.itos):
+            raise ValueError("Default index must be within the vocabulary size.")
+        self._default_index = index
+        # Update the default factory for collections.defaultdict if you were to use it
+        # self.stoi.default_factory = lambda: self._default_index
+        
+    def get_itos(self):
+        """Returns the list of tokens in order of their index."""
+        return self.itos
+
+
 
 
 # This function remains unchanged
