@@ -2,9 +2,8 @@ from torch import nn, Tensor
 from typing import Dict, Mapping, Optional, Tuple, Any, Union
 #from scgpt.model import BatchLabelEncoder
 from tqdm import trange
-
+import copy
 import numpy as np
-
 import torch
 from torch import nn
 from torch.distributions import Bernoulli
@@ -29,11 +28,16 @@ from .modules import (
     PSDecoder,
     Batch2LabelEncoder,
     LearnableWeightedRGCN,
-    PerturbationDecoder
+    PerturbationDecoder,
+    GeneHead,
+    GenePTHybridEmbedding
 )
 
 
 class PertTFGraphModel(TransformerModel):
+    """
+    Perturbation Model that leverages prior Knowledge Graph Information to generate meaningful perturbation embeddings
+    """
     def __init__(self,
                  n_pert: int,
                  nlayers_pert: int,
@@ -45,6 +49,8 @@ class PertTFGraphModel(TransformerModel):
         self.pert_pad_id = kwargs.pop("pert_pad_id", None) # get the pert_pad_id
         self.pert_dim = kwargs.pop('pert_dim', None)
         self.sep_pert_mvc = kwargs.pop('sep_pert_mvc', False)
+        self.pert_style = kwargs.pop('pert_style', 'concat')
+        self.gene_pert_shared = kwargs.pop('gene_pert_shared', False)
         super().__init__(*args, **kwargs)
         self.pert_graph = pert_graph
         # add perturbation encoder
@@ -53,14 +59,34 @@ class PertTFGraphModel(TransformerModel):
         pert_dim = d_model if self.pert_dim is None else self.pert_dim
         #self.pert_encoder = nn.Embedding(3, d_model, padding_idx=pert_pad_id)
         # Select Perturbation Encoding Style
-        if self.pert_graph is None:
-            self.pert_encoder = PertLabelEncoder(n_pert, pert_dim, padding_idx=self.pert_pad_id)
-        else:
-            self.pert_encoder = LearnableWeightedRGCN(n_pert, pert_dim, self.pert_graph)
+        # NOTE 
+        # if self.gene_pert_shared == True or self.base_emb IS NOT None
+        # this means there should be a master vocabulary that defines indices for both perturbations and genes
+        # This would allow base embedding to 
+        # enforcing this requries some tokenization class object that is saved and loaded with the model
+        # this tokenization object is always loaded prior to any model loading or tokenization of data
+        if self.pert_graph is None: # No graph embedding
+            if self.base_emb is None: # vanilla embeddings
+                if self.gene_pert_shared: # shared encoder for perturbation
+                    self.pert_encoder = self.encoder  
+                else:
+                    self.pert_encoder = PertLabelEncoder(n_pert, pert_dim, padding_idx=self.pert_pad_id)
+            else: # prior integrated embedding
+                self.pert_base_emb = self.base_emb if self.gene_pert_shared else copy.deepcopy(self.base_emb) # seperate prior embeddings if not shared
+                self.pert_encoder = GeneHead(self.pert_base_emb, d_model) 
+        else: # graph embeddings
+            if self.base_emb is None: # vanilla embeddings
+                if self.gene_pert_shared: # shared encoder for perturbation
+                    self.pert_encoder = LearnableWeightedRGCN(n_pert, pert_dim, self.pert_graph, self.encoder)
+                else:
+                    self.pert_encoder = LearnableWeightedRGCN(n_pert, pert_dim, self.pert_graph)
+            else:
+                self.pert_base_emb = self.base_emb if self.gene_pert_shared else copy.deepcopy(self.base_emb)
+                self.pert_encoder = LearnableWeightedRGCN(n_pert, pert_dim, self.pert_graph, self.pert_base_emb.embedding)
 
         # Select Perturbation Integration Style
-        if pert_dim == d_model:
-            self.pert_exp_encoder = PertExpEncoder(d_model) 
+        if self.pert_style == 'concat':
+            self.pert_exp_encoder = PertExpEncoder(d_model, pert_dim) 
         else:
             self.pert_exp_encoder = PertExpAE(d_model, pert_dim) 
 
@@ -192,17 +218,19 @@ class PertTFGraphModel(TransformerModel):
             dict of output Tensors.
         """
         
-        transformer_output_0 = self._encode(
+        transformer_output = self._encode(
             src, values, src_key_padding_mask, batch_labels,
             input_pert_flags= pert_labels, # Do we use pert_flags for transformer input?
         )
+        cur_gene_token_embs = self.encoder(mvc_src) if mvc_src is not None else self.cur_gene_token_embs
+        if self.decoder_layer:
+            cur_gene_token_embs = self.transformer_decoder(cur_gene_token_embs, transformer_output, memory_key_padding_mask=src_key_padding_mask)
         if self.use_batch_labels:
             batch_emb = self.batch_encoder(batch_labels)  # (batch, embsize)
-
-        transformer_output=transformer_output_0
             
         output = {}
         output["contrastive_dict"] = {}
+        #print(transformer_output.shape)
         mlm_output = self.decoder(
             transformer_output
             if not self.use_batch_labels
@@ -232,6 +260,8 @@ class PertTFGraphModel(TransformerModel):
         output['pert_emb'] = pert_embeddings
         if pert_labels_next is not None: #and False:
             #import pdb; pdb.set_trace()
+            #print(pert_embeddings['final_embs'].shape)
+            #print(pert_labels_next)
             pert_emb_next = pert_embeddings['final_embs'][pert_labels_next]#self.pert_encoder(pert_labels_next)
             if isinstance(pert_emb_next, tuple):
                 pert_emb_next = pert_emb_next[0]
@@ -257,7 +287,7 @@ class PertTFGraphModel(TransformerModel):
             output["cls_output"] = self.cls_decoder(cell_emb)  # (batch, n_cls)
             output["cls_output_next"] = self.cls_decoder(cell_emb_next)  # (batch, n_cls)
 
-        cur_gene_token_embs = self.encoder(mvc_src) if mvc_src is not None else self.cur_gene_token_embs
+        
         if MVC:
             mvc_output = self.mvc_decoder(
                 cell_emb

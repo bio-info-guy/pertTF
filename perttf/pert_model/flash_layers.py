@@ -286,7 +286,6 @@ class FlashTransformerEncoderLayerVarlen(nn.Module):
                         max_seqlen_k=max_seqlen,
                         softmax_scale=None,
                         causal=self.causal,
-                    
                     )
                 elif self.flash_version == '2':
                     attn_output_packed = flash_attn_varlen_func(
@@ -491,13 +490,14 @@ class SDPATransformerEncoderLayer(nn.Module):
 
         # The entire logic for varlen and packed attention is replaced by this single call.
         # SDPA handles the padding mask and causality internally.
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,  # Pass the reshaped mask here
-            dropout_p=self.dropout1.p if self.training else 0.0,
-            is_causal=self.causal
-        )
-        
+        with torch.nn.attention.sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,  # Pass the reshaped mask here
+                dropout_p=self.dropout1.p if self.training else 0.0,
+                is_causal=self.causal
+            )
+            
         # Reshape output back to (batch_size, seq_len, d_model)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         
@@ -537,3 +537,199 @@ class SDPATransformerEncoderLayer(nn.Module):
             src = src.transpose(0, 1)
             
         return src
+
+class FlashCrossTransformerLayer(nn.Module):
+    """
+    A Transformer Layer specifically designed for Cross Attention between:
+    1. Dense Queries (Vocab Embeddings) - Uniform length, no padding.
+    2. Ragged Keys/Values (Context) - Variable length, has padding.
+    
+    It uses FlashAttention Varlen to skip computation on padding tokens in the Context.
+    """
+    def __init__(
+        self,
+        d_model,
+        nhead,
+        dim_feedforward=2048,
+        dropout=0.1,
+        activation="relu",
+        layer_norm_eps=1e-5,
+        device=None,
+        batch_first=True,
+        dtype=None,
+        norm_scheme="post", # "pre" or "post"
+        bias=False
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.flash_version = FLASH_ATTENTION_VERSION
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        assert self.head_dim * nhead == d_model, "d_model must be divisible by nhead"
+        
+        self.dropout_p = dropout
+        self.norm_scheme = norm_scheme
+        self.self_attn = Empty() # Dummy code because TransformerEncoder expects self.self_attn.batch_first
+        self.self_attn.batch_first = batch_first
+        # 1. Cross Attention Components
+        # We separate Q from KV because they come from different tensors
+        self.q_proj = nn.Linear(d_model, d_model, bias=bias, **factory_kwargs)
+        self.kv_proj = nn.Linear(d_model, 2 * d_model, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(d_model, d_model, bias=bias, **factory_kwargs)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        
+        # 2. Feed Forward Components
+        self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model, **factory_kwargs)
+        self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.activation = self._get_activation_fn(activation)
+
+    @staticmethod
+    def _get_activation_fn(activation):
+        if activation == "relu": return F.relu
+        elif activation == "gelu": return F.gelu
+        raise RuntimeError(f"activation should be relu/gelu, not {activation}")
+
+    def _pack_memory_kv(self, key_input, padding_mask):
+        """
+        Packs the context (Key/Value) input by removing padded tokens.
+        Returns packed KV tensor and cu_seqlens_k.
+        """
+        batch_size, seq_len, _ = key_input.shape
+        
+        # Project to K, V: (B, L, 2*D) -> (B, L, 2, H, D_head)
+        kv = self.kv_proj(key_input).view(batch_size, seq_len, 2, self.nhead, self.head_dim)
+        k, v = kv.unbind(2) # Each is (B, L, H, D_head)
+
+        if padding_mask is None:
+            # No padding: Simple flatten
+            k_packed = k.reshape(-1, self.nhead, self.head_dim)
+            v_packed = v.reshape(-1, self.nhead, self.head_dim)
+            
+            # cu_seqlens is simple arithmetic progression: [0, L, 2L, ...]
+            seqlens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=key_input.device)
+            cu_seqlens_k = torch.cat([
+                torch.zeros(1, dtype=torch.int32, device=key_input.device),
+                seqlens.cumsum(0, dtype=torch.int32)
+            ])
+            max_seqlen_k = seq_len
+        else:
+            # Handle Padding: Remove masked tokens
+            valid_mask = ~padding_mask.bool() # True = Valid Token
+            seqlens = valid_mask.sum(dim=1, dtype=torch.int32)
+            
+            cu_seqlens_k = torch.cat([
+                torch.zeros(1, dtype=torch.int32, device=key_input.device),
+                seqlens.cumsum(0, dtype=torch.int32)
+            ])
+            
+            # Pack using boolean indexing
+            valid_indices = torch.nonzero(valid_mask.flatten(), as_tuple=True)[0]
+            
+            k_flat = k.view(-1, self.nhead, self.head_dim)
+            v_flat = v.view(-1, self.nhead, self.head_dim)
+            
+            k_packed = k_flat[valid_indices]
+            v_packed = v_flat[valid_indices]
+            max_seqlen_k = seqlens.max().item()
+
+        return k_packed, v_packed, cu_seqlens_k, max_seqlen_k
+
+    def _cross_attention(self, tgt, memory, memory_padding_mask=None):
+        """
+        tgt: (Batch, Vocab, Dim) - The Query
+        memory: (Batch, Context, Dim) - The Key/Value
+        """
+        batch_size, vocab_size, _ = tgt.shape
+        
+        # 1. Prepare Queries (Dense)
+        # (B, V, D) -> (B, V, H, D_head) -> (B*V, H, D_head)
+        q = self.q_proj(tgt).view(batch_size, vocab_size, self.nhead, self.head_dim)
+        q_packed = q.view(-1, self.nhead, self.head_dim)
+        
+        # Create cu_seqlens for Q (Uniform length)
+        # [0, V, 2V, ..., B*V]
+        cu_seqlens_q = torch.arange(
+            0, (batch_size + 1) * vocab_size, step=vocab_size, 
+            dtype=torch.int32, device=tgt.device
+        )
+        max_seqlen_q = vocab_size
+
+        # 2. Prepare Keys/Values (Ragged)
+        k_packed, v_packed, cu_seqlens_k, max_seqlen_k = self._pack_memory_kv(memory, memory_padding_mask)
+
+        # 3. Flash Attention Varlen
+        # Note: dropout_p=0.0 during inference
+        if self.flash_version == '3':
+                attn_out_packed = flash_attn_varlen_func(
+                q_packed, k_packed, v_packed,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=None,
+                causal=False
+            )
+        
+        elif self.flash_version == '2':
+            attn_out_packed = flash_attn_varlen_func(
+                q_packed, k_packed, v_packed,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                softmax_scale=None,
+                causal=False
+            )
+        
+
+        # 4. Unpack and Project
+        # (B*V, H, D_head) -> (B, V, D)
+        attn_out = attn_out_packed.view(batch_size, vocab_size, self.d_model)
+        return self.out_proj(attn_out)
+
+    def forward(
+        self, 
+        tgt: torch.Tensor, 
+        memory: torch.Tensor, 
+        memory_key_padding_mask: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            tgt: (Batch, Vocab_Size, Dim) - The static embeddings (Query Source)
+            memory: (Batch, Seq_Len, Dim) - The transformer output (Key/Value Source)
+            memory_key_padding_mask: (Batch, Seq_Len) - True where padding exists
+        
+        Returns:
+            (Batch, Vocab_Size, Dim) - The updated embeddings
+        """
+        
+        # Pre-Norm Architecture
+        if self.norm_scheme == "pre":
+            # 1. Cross Attention Block
+            tgt_norm = self.norm1(tgt)
+            attn_out = self._cross_attention(tgt_norm, memory, memory_key_padding_mask)
+            tgt = tgt + self.dropout1(attn_out)
+            
+            # 2. Feed Forward Block
+            tgt_norm = self.norm2(tgt)
+            ff_out = self.linear2(self.dropout(self.activation(self.linear1(tgt_norm))))
+            tgt = tgt + self.dropout2(ff_out)
+            
+        # Post-Norm Architecture
+        else:
+            # 1. Cross Attention Block
+            attn_out = self._cross_attention(tgt, memory, memory_key_padding_mask)
+            tgt = self.norm1(tgt + self.dropout1(attn_out))
+            
+            # 2. Feed Forward Block
+            ff_out = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+            tgt = self.norm2(tgt + self.dropout2(ff_out))
+            
+        return tgt

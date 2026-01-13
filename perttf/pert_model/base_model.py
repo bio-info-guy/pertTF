@@ -7,11 +7,9 @@ import numpy as np
 from torch import nn, Tensor
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.nn import TransformerEncoder, TransformerEncoderLayer, TransformerDecoder, TransformerDecoderLayer
 from torch.distributions import Bernoulli
 from tqdm import trange
-from .dsbn import DomainSpecificBatchNorm1d
-from .grad_reverse import grad_reverse
 import dataclasses
 from .modules import (
     AutoDiscretizationEmbedding, 
@@ -24,12 +22,15 @@ from .modules import (
     MVCDecoder, 
     AdversarialDiscriminator,
     GenePTHybridEmbedding,
-    GenePTHead,
+    GeneHead,
     Similarity,
-    CrossAttn)
+    CrossAttn,
+    DomainSpecificBatchNorm1d,
+    grad_reverse,
+    )
 
 """
-Base Model is scGPT's TransformerModel
+Base Model is based off scGPT's TransformerModel
 """
 class TransformerModel(nn.Module):
     def __init__(
@@ -64,7 +65,8 @@ class TransformerModel(nn.Module):
         bin_num: int = 10,
         bin_alpha: float= 1.0,
         genept_path: str='data/external_embeddings/GenePT_emebdding_v2/GenePT_gene_protein_embedding_model_3_text.pickle',
-        cross_attn_decoder: bool = False
+        cross_attn_decoder: bool = False,
+        decoder_layer: bool = False,
     ):
         super().__init__()
         self.model_type = "Transformer"
@@ -75,15 +77,18 @@ class TransformerModel(nn.Module):
         self.domain_spec_batchnorm = domain_spec_batchnorm
         self.input_emb_style = input_emb_style
         self.cell_emb_style = cell_emb_style
+        self.gene_emb_style = gene_emb_style
+        self.mvc_decoder_style = mvc_decoder_style
         self.explicit_zero_prob = explicit_zero_prob
         self.norm_scheme = "pre" if pre_norm else "post"
         self.expr_activation = expr_activation
-        self.mvc_decoder_style = mvc_decoder_style
         self.n_cls = n_cls
         self.mask_value = mask_value
         self.pad_value = pad_value
         self.nhead = nhead
         self.dropout = dropout
+        self.genept_path = genept_path
+        self.decoder_layer = decoder_layer
         if self.input_emb_style not in ["category", "continuous", "scaling",'autobin']:
             raise ValueError(
                 f"input_emb_style should be one of category, continuous, scaling or autobin "
@@ -93,73 +98,82 @@ class TransformerModel(nn.Module):
             raise ValueError(f"Unknown cell_emb_style: {cell_emb_style}")
         
         self.use_fast_transformer = use_fast_transformer
-        if self.use_fast_transformer:
+        if self.use_fast_transformer == 'flash':
             try:
-                from .flash_layers import FlashTransformerEncoderLayerVarlen, SDPATransformerEncoderLayer
-                try:
-                    from .flash_layers import FlashTransformerEncoderLayerVarlen
-                    encoder_layers = FlashTransformerEncoderLayerVarlen(
+                from .flash_layers import FlashTransformerEncoderLayerVarlen
+                encoder_layers = FlashTransformerEncoderLayerVarlen(
+                    d_model,
+                    nhead,
+                    d_hid,
+                    dropout,
+                    batch_first=True,
+                    norm_scheme=self.norm_scheme,
+                )
+                if self.decoder_layer:
+                    from .flash_layers import FlashCrossTransformerLayer
+                    decoder_layer = FlashCrossTransformerLayer(
                         d_model,
                         nhead,
                         d_hid,
                         dropout,
-                        batch_first=True,
-                        norm_scheme=self.norm_scheme,
+                        norm_scheme=self.norm_scheme, # "pre" or "post"
                     )
-                    if encoder_layers.flash_version is not None:
-                        self.transformer_encoder = TransformerEncoder(encoder_layers,  nlayers)
-                except:
-                    print(e)
-                    print('No DAO flash attention available, trying pytorch SDPA backend')
-                    from .flash_layers import SDPATransformerEncoderLayer
-                    encoder_layers = SDPATransformerEncoderLayer(
-                        d_model,
-                        nhead,
-                        d_hid,
-                        dropout,
-                        batch_first=True,
-                        norm_scheme=self.norm_scheme,
-                    )
-                    self.transformer_encoder = TransformerEncoder(encoder_layers,  nlayers)
-                    
+                    self.transformer_decoder = decoder_layer
+            except:
+                print(e)
+                print('No DAO flash attention available, trying pytorch SDPA backend')
+                self.use_fast_transformer == 'sdpa'
+        if self.use_fast_transformer == 'sdpa':
+            try:
+                from .flash_layers import SDPATransformerEncoderLayer
+                encoder_layers = SDPATransformerEncoderLayer(
+                    d_model,
+                    nhead,
+                    d_hid,
+                    dropout,
+                    batch_first=True,
+                    norm_scheme=self.norm_scheme,
+                )
             except Exception as e: 
                 print(e)
                 print('fast attention setup, falling back to native pytorch attention')
-                encoder_layers = TransformerEncoderLayer(
-                    d_model, nhead, d_hid, dropout, batch_first=True
-                )
-                self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
+                self.use_fast_transformer = 'native'
+        if self.use_fast_transformer == 'native':
+            encoder_layers = TransformerEncoderLayer(
+                d_model, nhead, d_hid, dropout, batch_first=True
+            )
+        self.transformer_encoder = TransformerEncoder(encoder_layers,  nlayers)
+        
 
         # TODO: add dropout in the GeneEncoder
         # Select Gene Encoder
-        if gene_emb_style == 'vanilla':
+        if self.gene_emb_style == 'vanilla':
             self.base_emb = None
             self.encoder = GeneEncoder(ntoken, d_model, padding_idx=vocab[pad_token])
-        elif gene_emb_style == 'genept':
+        elif self.gene_emb_style == 'genept':
             self.base_emb = GenePTHybridEmbedding(
                 genept_pickle_path= genept_path, 
                 vocab = vocab, 
-                embedding_dim=3072,
                 padding_idx=vocab[pad_token]
             )
-            self.encoder = GenePTHead(self.base_emb, d_model)
-        elif gene_emb_style == 'esm':
+            self.encoder = GeneHead(self.base_emb, d_model)
+        elif self.gene_emb_style == 'esm':
             pass
-        elif gene_emb_style == 'luca':
+        elif self.gene_emb_style == 'luca':
             pass
-        elif gene_emb_style == 'llm':
+        elif self.gene_emb_style == 'llm':
             pass
-        self.gene_emb_style = gene_emb_style
+        
 
         # Value Encoder, NOTE: the scaling style is also handled in _encode method
-        if input_emb_style == "continuous":
+        if self.input_emb_style == "continuous":
             self.value_encoder = ContinuousValueEncoder(d_model, dropout)
-        elif input_emb_style == "category":
+        elif self.input_emb_style == "category":
             assert n_input_bins > 0
             self.value_encoder = CategoryValueEncoder(
                 n_input_bins, d_model, padding_idx=pad_value
             )
-        elif input_emb_style == 'autobin':
+        elif self.input_emb_style == 'autobin':
             """
             scFoundation Style Expression Encoder
             """
@@ -218,7 +232,8 @@ class TransformerModel(nn.Module):
     def init_weights(self) -> None:
         initrange = 0.1
         # TODO: check if this initialization is helpful and shall we apply to all?
-        self.encoder.embedding.weight.data.uniform_(-initrange, initrange)
+        if self.base_emb is None:
+            self.encoder.embedding.weight.data.uniform_(-initrange, initrange)
 
     def _encode(
         self,
@@ -373,11 +388,13 @@ class TransformerModel(nn.Module):
         values: Tensor,
         src_key_padding_mask: Tensor,
         batch_labels: Optional[Tensor] = None,
+        mvc_src: Tensor = None ,
         CLS: bool = False,
         CCE: bool = False,
         MVC: bool = False,
         ECS: bool = False,
         do_sample: bool = False,
+        
     ) -> Mapping[str, Tensor]:
         """
         Args:
@@ -401,9 +418,12 @@ class TransformerModel(nn.Module):
         transformer_output = self._encode(
             src, values, src_key_padding_mask, batch_labels
         )
+        
         if self.use_batch_labels:
             batch_emb = self.batch_encoder(batch_labels)  # (batch, embsize)
-
+        cur_gene_token_embs = self.encoder(mvc_src) if mvc_src is not None else self.cur_gene_token_embs
+        if self.decoder_layer:
+            cur_gene_token_embs = self.transformer_decoder(cur_gene_token_embs, transformer_output, memory_key_padding_mask=src_key_padding_mask)
         output = {}
         mlm_output = self.decoder(
             transformer_output
@@ -466,7 +486,7 @@ class TransformerModel(nn.Module):
                 if not self.use_batch_labels
                 else torch.cat([cell_emb, batch_emb], dim=1),
                 # else cell_emb + batch_emb,
-                self.cur_gene_token_embs,
+                cur_gene_token_embs,
             )
             if self.explicit_zero_prob and do_sample:
                 bernoulli = Bernoulli(probs=mvc_output["zero_probs"])

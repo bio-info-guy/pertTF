@@ -17,10 +17,10 @@ class LearnableWeightedRGCN(nn.Module):
         super().__init__()
         self.num_nodes = num_nodes
         self.embedding_dim = embedding_dim
-        
+        self.pert_emb_dim = embedding_dim if node_emb is None else node_emb.weight.shape[-1]
         # 1. PRE-TRANSFORM
         self.pre_encoder = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
+            nn.Linear(self.pert_emb_dim, embedding_dim),
             nn.LayerNorm(embedding_dim), 
             nn.GELU()
         )
@@ -52,10 +52,11 @@ class LearnableWeightedRGCN(nn.Module):
         self.self_loop_weight = nn.Linear(embedding_dim, embedding_dim, bias=True)
         self.bias = nn.Parameter(torch.zeros(embedding_dim))
         if node_emb is None:
-            self.node_emb = nn.Embedding(num_nodes, embedding_dim)
+            self.node_emb = nn.Embedding(num_nodes, self.pert_emb_dim)
+            nn.init.xavier_uniform_(self.node_emb.weight)
         else:
             self.node_emb = node_emb
-        nn.init.xavier_uniform_(self.node_emb.weight)
+        
         self.final_norm = nn.LayerNorm(embedding_dim)
 
     def forward(self, target_node_indices=None):
@@ -119,7 +120,7 @@ class LearnableWeightedRGCN(nn.Module):
         out = out_accum  + self.bias #+ self_loop
         out = F.gelu(out)
         
-        control_emb = x_all[self.num_nodes-1].unsqueeze(0)
+        control_emb = x[self.num_nodes-1].unsqueeze(0)
         final = torch.cat([out[:self.num_nodes-1], control_emb], dim=0)
         final = self.final_norm(final)
         
@@ -136,6 +137,7 @@ class LearnableMultiViewGNN_Sparse(nn.Module):
         self.hops = hops
         self.adj_t_list = []
         self.num_relations = len(graph_data_list)
+        self.pert_emb_dim = embedding_dim if node_emb is None else node_emb.weight.shape[-1]
         for i, (edge_index, edge_weight) in enumerate(graph_data_list):
             # Create Data object
             # Use GCNNorm explicitly. 
@@ -157,15 +159,15 @@ class LearnableMultiViewGNN_Sparse(nn.Module):
         # 2. EMBEDDINGS
         # We need 20,000 graph nodes + 1 control node
         self.pre_encoder = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
+            nn.Linear(self.pert_emb_dim, embedding_dim),
             nn.LayerNorm(embedding_dim),
             nn.GELU()
         )
         if node_emb is None:
-            self.node_emb = nn.Embedding(num_nodes, embedding_dim) 
+            self.node_emb = nn.Embedding(num_nodes, self.pert_emb_dim) 
+            nn.init.xavier_uniform_(self.node_emb.weight)
         else:
             self.node_emb = node_emb
-        nn.init.xavier_uniform_(self.node_emb.weight)
         self.final_norm = nn.LayerNorm(embedding_dim)
         # 3. VIEW ENCODERS (Replaces SGConv internals)
         # We just need a Linear layer and Norm for each view
@@ -228,7 +230,7 @@ class LearnableMultiViewGNN_Sparse(nn.Module):
             alpha = None
         
         # Handle Control Token
-        control_emb = x_all[self.num_nodes-1].unsqueeze(0)
+        control_emb = x_graph[self.num_nodes-1].unsqueeze(0)
         final = torch.cat([fused[:self.num_nodes-1], control_emb], dim=0)
         final = self.final_norm(final)
         if target_node_indices is not None:
@@ -431,10 +433,11 @@ class PertExpEncoder(nn.Module):
     """
     def __init__(
         self,
-        d_model: int
+        d_model: int,
+        d_pert: int
     ):
         super().__init__()
-        d_in = d_model * 2 
+        d_in = d_model + d_pert
         #d_in = d_model
         self.fc = nn.Sequential(
             nn.Linear(d_in, d_model),
@@ -556,7 +559,7 @@ class ExprDecoder(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(d_model, d_model),
             nn.LeakyReLU(),
-            nn.Linear(4*d_model, 1),
+            nn.Linear(d_model, 1),
             
         )
         self.explicit_zero_prob = explicit_zero_prob
@@ -788,7 +791,7 @@ class AutoDiscretizationEmbedding(nn.Module):
     def forward(self, x, output_weight=0):
         x_mask_idx = (x==self.mask_token_id).nonzero()
         x_pad_idx = (x==self.pad_token_id).nonzero()
-        
+        x = x.unsqueeze(-1)
         x = self.mlp(x) # [B,N,1] -> [B,N,H]
         x = self.LeakyReLU(x) # [B,N,H]
         x_crosslayer = self.mlp2(x) # [B,N,H]
@@ -918,17 +921,15 @@ class GenePTHybridEmbedding(nn.Module):
     def __init__(self, 
                  genept_pickle_path: str, 
                  vocab: Dict, 
-                 embedding_dim: int = 3072,
                  padding_idx = None
                  ):
         super().__init__()
         
-        self.embedding_dim = embedding_dim
         self.vocab = vocab
         self.vocab_size = len(self.vocab)
-        
+        self.padding_idx = padding_idx
         # 1. Create the unified embedding layer
-        self.embedding = nn.Embedding(self.vocab_size, embedding_dim, padding_idx=padding_idx)
+        
         
         # 2. Load and Filter Data (Memory Efficiency Step)
         self._init_weights_from_pickle(genept_pickle_path)
@@ -953,11 +954,13 @@ class GenePTHybridEmbedding(nn.Module):
         try:
             with open(path, 'rb') as f:
                 full_genept_dict = pickle.load(f)
+            self.embedding_dim = len(full_genept_dict[list(full_genept_dict.keys())[0]])
         except FileNotFoundError:
             # Fallback for demonstration if file doesn't exist
             print("Warning: GenePT file not found. Initializing randomly for demo.")
             full_genept_dict = {}
-
+            self.embedding_dim = 512
+        self.embedding = nn.Embedding(self.vocab_size, self.embedding_dim, padding_idx=self.padding_idx)
         # Tracking stats
         self.found_genes_indices = []
         self.missing_genes_indices = []
@@ -1061,7 +1064,7 @@ class GenePTHybridEmbedding(nn.Module):
         return self.embedding(gene_indices)
 
 
-class GenePTHead(nn.Module):
+class GeneHead(nn.Module):
     """
     The Comprehensive Module.
     Wraps the embeddings and the two task heads (Transformer & GNN).
@@ -1151,3 +1154,96 @@ class CrossAttn(nn.Module):
         expanded_embeddings = self.norm(query + self.dropout(attn_out))
         
         return expanded_embeddings
+    
+
+class GradReverse(Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, lambd: float) -> torch.Tensor:
+        ctx.lambd = lambd
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        return grad_output.neg() * ctx.lambd, None
+
+
+def grad_reverse(x: torch.Tensor, lambd: float = 1.0) -> torch.Tensor:
+    return GradReverse.apply(x, lambd)
+
+# The code is modified from https://github.com/wgchang/DSBN/blob/master/model/dsbn.py and SCGPT
+class _DomainSpecificBatchNorm(nn.Module):
+    _version = 2
+
+    def __init__(
+        self,
+        num_features: int,
+        num_domains: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+    ):
+        super(_DomainSpecificBatchNorm, self).__init__()
+        self._cur_domain = None
+        self.num_domains = num_domains
+        self.bns = nn.ModuleList(
+            [
+                self.bn_handle(num_features, eps, momentum, affine, track_running_stats)
+                for _ in range(num_domains)
+            ]
+        )
+
+    @property
+    def bn_handle(self) -> nn.Module:
+        raise NotImplementedError
+
+    @property
+    def cur_domain(self) -> Optional[int]:
+        return self._cur_domain
+
+    @cur_domain.setter
+    def cur_domain(self, domain_label: int):
+        self._cur_domain = domain_label
+
+    def reset_running_stats(self):
+        for bn in self.bns:
+            bn.reset_running_stats()
+
+    def reset_parameters(self):
+        for bn in self.bns:
+            bn.reset_parameters()
+
+    def _check_input_dim(self, input: torch.Tensor):
+        raise NotImplementedError
+
+    def forward(self, x: torch.Tensor, domain_label: int) -> torch.Tensor:
+        self._check_input_dim(x)
+        if domain_label >= self.num_domains:
+            raise ValueError(
+                f"Domain label {domain_label} exceeds the number of domains {self.num_domains}"
+            )
+        bn = self.bns[domain_label]
+        self.cur_domain = domain_label
+        return bn(x)
+
+
+class DomainSpecificBatchNorm1d(_DomainSpecificBatchNorm):
+    @property
+    def bn_handle(self) -> nn.Module:
+        return nn.BatchNorm1d
+
+    def _check_input_dim(self, input: torch.Tensor):
+        if input.dim() > 3:
+            raise ValueError(
+                "expected at most 3D input (got {}D input)".format(input.dim())
+            )
+
+
+class DomainSpecificBatchNorm2d(_DomainSpecificBatchNorm):
+    @property
+    def bn_handle(self) -> nn.Module:
+        return nn.BatchNorm2d
+
+    def _check_input_dim(self, input: torch.Tensor):
+        if input.dim() != 4:
+            raise ValueError("expected 4D input (got {}D input)".format(input.dim()))

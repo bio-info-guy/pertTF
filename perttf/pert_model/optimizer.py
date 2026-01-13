@@ -15,13 +15,13 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1):
     else:
         discriminator = None
 
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, eps=1e-4 if config.amp else 1e-8
     )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=config.schedule_ratio)
 
     if DAB_separate_optim:
-        optimizer_dab = torch.optim.Adam(model.parameters(), lr=config.lr)
+        optimizer_dab = torch.optim.AdamW(model.parameters(), lr=config.lr)
         scheduler_dab = torch.optim.lr_scheduler.StepLR(
             optimizer_dab, config.schedule_interval, gamma=config.schedule_ratio
         )
@@ -30,11 +30,11 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1):
         scheduler_dab = None
 
     if config.ADV:
-        optimizer_E = torch.optim.Adam(model.parameters(), lr=config.lr_ADV)
+        optimizer_E = torch.optim.AdamW(model.parameters(), lr=config.lr_ADV)
         scheduler_E = torch.optim.lr_scheduler.StepLR(
             optimizer_E, config.schedule_interval, gamma=config.schedule_ratio
         )
-        optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=config.lr_ADV)
+        optimizer_D = torch.optim.AdamW(discriminator.parameters(), lr=config.lr_ADV)
         scheduler_D = torch.optim.lr_scheduler.StepLR(
             optimizer_D, config.schedule_interval, gamma=config.schedule_ratio
         )
