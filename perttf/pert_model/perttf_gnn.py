@@ -519,6 +519,8 @@ class PertTFGraphModel(TransformerModel):
                 # else transformer_output + batch_emb.unsqueeze(1),
                 )
                 cur_gene_token_embs = self.encoder(mvc_src_d) if mvc_src_d is not None else self.cur_gene_token_embs
+                if self.decoder_layer:
+                    cur_gene_token_embs = self.transformer_decoder(cur_gene_token_embs, raw_output, memory_key_padding_mask=src_key_padding_mask_d)
                 mvc_output = self.mvc_decoder(
                                 cell_emb if not self.use_batch_labels
                                 else torch.cat([cell_emb, batch_emb], 

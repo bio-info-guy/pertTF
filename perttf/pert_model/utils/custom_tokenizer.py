@@ -22,7 +22,6 @@ class MasterVocab:
     def __init__(self, 
                  tokens: list = None, 
                  special_tokens: list = ['<pad>', '<cls>', '<unk>', '<eos>'], 
-                 vocab_path:str = None,
                  dict_list: List[Dict] = None):
         """
         Args:
@@ -35,9 +34,7 @@ class MasterVocab:
             for d in dict_list:
                 tokens = tokens + list(d.keys())
             tokens = sorted(set(tokens))
-        if vocab_path is not None:
-            self.from_json(vocab_path, special_tokens)
-        elif tokens is not None:
+        if tokens is not None:
             self.special_tokens = special_tokens if special_tokens else []
 
             # Combine special tokens and unique regular tokens
@@ -92,19 +89,36 @@ class MasterVocab:
         """Returns the list of tokens in order of their index."""
         return self.itos
     
-    def from_json(self, json_file: str, special_tokens: list = None):
+    @classmethod
+    def from_json(cls, json_file: str, special_tokens: list = ['<pad>', '<cls>', '<unk>', '<eos>']):
         with open(json_file) as f:
             stoi = json.load(f)
+        self = cls()
         self.special_tokens = [s for s in special_tokens if s in stoi] if special_tokens else []
         self.stoi = stoi
-        self.itos = {i:t for i,t in enumerate(stoi)}
+        self.itos = {v:k for k,v in stoi.items()}
 
         # Create sorted arrays for fast NumPy lookups
         if "<pad>" in self.stoi:
             self.set_default_index(self.stoi["<pad>"])
         elif "<unk>" in self.stoi:
             self.set_default_index(self.stoi["<unk>"])
-        
+        return self
+    
+    @classmethod
+    def from_map(cls, map: Dict, special_tokens: list = ['<pad>', '<cls>', '<unk>', '<eos>']): 
+        self = cls()
+        self.special_tokens = [s for s in special_tokens if s in map] if special_tokens else []
+        self.stoi = map
+        self.itos = {v:k for k,v in map.items()}
+
+        # Create sorted arrays for fast NumPy lookups
+        if "<pad>" in self.stoi:
+            self.set_default_index(self.stoi["<pad>"])
+        elif "<unk>" in self.stoi:
+            self.set_default_index(self.stoi["<unk>"])
+        return self
+
 
     def append(self, token: str):
         assert token not in self.stoi and token and type(token) == str, 'cannot append token, please check if token is str, not empty and new'
