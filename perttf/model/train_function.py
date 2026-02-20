@@ -35,6 +35,7 @@ from ..custom_loss import (
     GenerativeExpressionLoss
 )
 from ..utils.plot import process_and_log_umaps
+from ..utils.metrics import cell_eval_to_wandb
 from ..utils.misc import init_plot_worker
 
 
@@ -888,6 +889,7 @@ def wrapper_train(model, config, data_gen,
             if p.done():
                 try:
                     result = p.result()
+                    print(result)
                     metrics_to_log = result['metrics']
                     for key, img_path in result['images'].items():
                         metrics_to_log[key]= wandb.Image(img_path)  
@@ -960,8 +962,14 @@ def wrapper_train(model, config, data_gen,
             #logger.info(f"Saving model to {save_dir}")
             save_dir2 = save_dir / f'e{epoch}_imgs'
             save_dir2.mkdir(parents=True, exist_ok=True)
-            for eval_dict_key, eval_adata in eval_adata_dict.items():
+            for key, item in eval_adata_dict.items():
                 # Step 1: Get AnnData with embeddings from the main process
+                if config.next_cell_pred_type == "pert":
+                    eval_adata = item[0]
+                    true = item[1]
+                else:
+                    eval_adata = item
+                
                 results = eval_testdata(
                     #best_model,
                     model, # use current model
@@ -972,18 +980,19 @@ def wrapper_train(model, config, data_gen,
                     include_types=["cls"],
                     logger=logger,
                     epoch=epoch,
-                    eval_key=eval_dict_key,
+                    eval_key=key,
                     predict_expr = predict_expr_tmp,
-                    mvc_full_expr= predict_expr_tmp
+                    mvc_full_expr= predict_expr_tmp,
+                    sizefactor = True,
+                    sample = True
                 )
                 adata_with_embeddings = results
-                
                 # Step 2: Save the data to a temporary file for the child process
                 #temp_adata_path = save_dir2 / f"temp_adata_{eval_dict_key}_e{epoch}.h5ad"
                 #adata_with_embeddings.write_h5ad(temp_adata_path)
 
                 # Step 3: Create and start the background process
-                logger.info(f"Starting background process for UMAP on epoch {epoch} for '{eval_dict_key}'")
+                logger.info(f"Starting background process for UMAP on epoch {epoch} for '{key}'")
                 
                 # Pass data_gen['ps_names'] if it exists, otherwise None
                 ps_names = data_gen.get('ps_names', None)
@@ -991,11 +1000,18 @@ def wrapper_train(model, config, data_gen,
                  #   target=process_and_log_umaps,
                   #  args=(adata_with_embeddings, config, epoch, eval_dict_key, save_dir2, ps_names)
                 #)
-                #p.start()           
-                p = executor.submit(
-                    process_and_log_umaps,
-                    adata_with_embeddings, OmegaConf.structured(dict(config)) , epoch, eval_dict_key, save_dir2, ps_names
-                )
+                #p.start()
+                #t =cell_eval_to_wandb(true, results, save_dir, epoch, key)
+                if config.next_cell_pred_type == "pert": 
+                    p = executor.submit(
+                        cell_eval_to_wandb,
+                        true, results, save_dir, epoch, key, config.get('min_eval_cells', 30)
+                    )         
+                else:
+                    p = executor.submit(
+                        process_and_log_umaps,
+                        adata_with_embeddings, OmegaConf.structured(dict(config)) , epoch, key, save_dir2, ps_names
+                    )
                 evaltest_processes.append(p)
 
             #metrics_to_log["test/best_model_epoch"] = best_model_epoch
