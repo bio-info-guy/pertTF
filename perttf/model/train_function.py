@@ -1005,7 +1005,7 @@ def wrapper_train(model, config, data_gen,
                 if config.next_cell_pred_type == "pert": 
                     p = executor.submit(
                         cell_eval_to_wandb,
-                        true, results, save_dir, epoch, key, config.get('min_eval_cells', 30)
+                        true, results, save_dir, epoch, key, config.get('min_eval_cells', 30), model.distribution
                     )         
                 else:
                     p = executor.submit(
