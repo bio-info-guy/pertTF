@@ -224,7 +224,7 @@ def run_cell_eval(adata_real, adata_pert, outdir, context_col = 'celltype', pert
             results[c] = evaluator.compute(skip_metrics = [m for m in ALL_METRICS if m not in METRICS_TO_TRACK])
     return results
 
-def cell_eval_to_wandb(true, pred, outdir, epoch, key = 'test', min_eval_cells =30, context_col = 'celltype', pert_col = 'genotype', ctrl = 'WT', distribution = 'nb'):
+def cell_eval_to_wandb(true, pred, outdir, epoch, key = 'test', min_eval_cells =30, distribution = 'nb', context_col = 'celltype', pert_col = 'genotype', ctrl = 'WT'):
     if distribution in ['nb', 'zinb', 'hnb', 'pois', 'zipois']:
         new_sf = 1/(np.sum(pred.obsm['mvc_next_expr'], 1)/np.median(np.sum(pred.obsm['mvc_next_expr'], 1))).reshape(-1,1)
         pred.obsm['mvc_next_expr'] = np.log(pred.obsm['mvc_next_expr']*new_sf + 1)
