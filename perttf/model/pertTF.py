@@ -83,7 +83,7 @@ class PerturbationTFModel(BaseModel):
                     encoder_layers = SDPATransformerEncoderLayer(
                         d_model,
                         nhead,
-                        d_hid,
+                        kwargs.get('dim_feedforward', d_hid),
                         self.dropout,
                         batch_first=True,
                         norm_scheme=self.norm_scheme,
