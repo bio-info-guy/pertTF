@@ -425,7 +425,8 @@ class SDPATransformerEncoderLayer(nn.Module):
         dtype=None,
         norm_scheme="post",
         causal=False,
-        bias = True
+        bias = True,
+        sdpa_backend: str = "cudnn",
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -434,6 +435,7 @@ class SDPATransformerEncoderLayer(nn.Module):
         self.nhead = nhead
         self.batch_first = batch_first
         self.causal = causal
+        self.sdpa_backend = sdpa_backend.lower()
         self.self_attn = Empty()
         self.self_attn.batch_first = batch_first
         self.head_dim = d_model // nhead
@@ -491,9 +493,17 @@ class SDPATransformerEncoderLayer(nn.Module):
             attn_mask = attn_mask.view(batch_size, 1, 1, seq_len)
 
 
+        # Map sdpa_backend string to SDPBackend enum
+        backend_map = {
+            "cudnn": SDPBackend.CUDNN_ATTENTION,
+            "math": SDPBackend.MATH,
+            "flash_attention": SDPBackend.FLASH_ATTENTION,
+        }
+        sdpa_backend = backend_map.get(self.sdpa_backend, SDPBackend.CUDNN_ATTENTION)
+        
         # The entire logic for varlen and packed attention is replaced by this single call.
         # SDPA handles the padding mask and causality internally.
-        with torch.nn.attention.sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+        with torch.nn.attention.sdpa_kernel(sdpa_backend):
             attn_output = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_mask,  # Pass the reshaped mask here
