@@ -866,6 +866,8 @@ def wrapper_train(model, config, data_gen,
      'genes': data_gen["genes"], # genes,
      'gene_ids': data_gen["gene_ids"], # gene_ids,
      'ps_names': data_gen["ps_names"],
+     'n_ps': data_gen.get("n_ps", 0),
+     'num_batch_labels': data_gen["num_batch_types"],
      'config': config.as_dict(), # config as dictionary
     }
     torch.save(running_parameters, save_dir / "running_parameters.pt")
@@ -880,7 +882,7 @@ def wrapper_train(model, config, data_gen,
         mp_context=multiprocessing.get_context('spawn') 
         )
     evaltest_processes = []
-
+    eval_type = 'cell-eval' if config.next_cell_pred_type == "pert" else 'umap'
     for epoch in range(1, config.epochs + 1):
         epoch_start_time = time.time()
         # Clean up background UMAP and metric calculations on past test-data eval
@@ -889,20 +891,21 @@ def wrapper_train(model, config, data_gen,
             if p.done():
                 try:
                     result = p.result()
-                    print(result)
                     metrics_to_log = result['metrics']
+                    formatted_results = json.dumps(metrics_to_log, indent=4)
+                    logger.info(f"Metrics:\n{formatted_results}")
                     for key, img_path in result['images'].items():
                         metrics_to_log[key]= wandb.Image(img_path)  
                     if metrics_to_log:
                         wandb.log(metrics_to_log)
-                    logger.info(f'Finished {result["eval_dict_key"]} UMAP for epoch {result["epoch"]}')
+                    logger.info(f'Finished {result["eval_dict_key"]} {eval_type} for epoch {result["epoch"]}')
                 except Exception as e:
-                    logger.warning(f'UMAP process failed due to: {e}')
+                    logger.warning(f'{eval_type} process failed due to: {e}')
             else:
                 remaining_processes.append(p)
          # Joins the process to release resources
         evaltest_processes = remaining_processes
-        logger.info(f"Active UMAP processes: {len( evaltest_processes)}")
+        logger.info(f"Active {eval_type} processes: {len( evaltest_processes)}")
 
         if config.do_train:
             train(
@@ -1032,13 +1035,15 @@ def wrapper_train(model, config, data_gen,
                 try:
                     result = p.result()
                     metrics_to_log = result['metrics']
+                    formatted_results = json.dumps(metrics_to_log, indent=4)
+                    logger.info(f"Metrics:\n{formatted_results}")
                     for key, img_path in result['images'].items():
                         metrics_to_log[key]= wandb.Image(img_path)  
                     if metrics_to_log:
                         wandb.log(metrics_to_log)
-                    logger.info(f'Finished {result["eval_dict_key"]} UMAP for epoch {result["epoch"]}')
+                    logger.info(f'Finished {result["eval_dict_key"]} {eval_type} for epoch {result["epoch"]}')
                 except Exception as e:
-                    logger.warning(f'UMAP process failed due to: {e}')
+                    logger.warning(f'{eval_type} process failed due to: {e}')
             else:
                 remaining_processes.append(p)
     # save the best model

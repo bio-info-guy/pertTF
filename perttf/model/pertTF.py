@@ -58,6 +58,7 @@ class PerturbationTFModel(BaseModel):
             nlayers = self.nlayers
             d_hid = self.d_hid
             nhead = self.nhead
+            encoder_layers = None  # Initialize to ensure defined regardless of path
             if self.fast_transformer_backend == 'flash':
                 try:
                     from .modules import FlashTransformerEncoderLayerVarlen
@@ -65,7 +66,7 @@ class PerturbationTFModel(BaseModel):
                     encoder_layers = FlashTransformerEncoderLayerVarlen(
                         d_model,
                         kwargs.get('nhead', nhead),
-                        kwargs.get('d_hid', d_hid),
+                        kwargs.get('dim_feedforward', d_hid),
                         self.dropout,
                         batch_first=True,
                         norm_scheme=self.norm_scheme
@@ -73,7 +74,7 @@ class PerturbationTFModel(BaseModel):
                 except Exception as e:
                     print(e)
                     print('DAO flash attention setup failed')
-                    self.fast_transformer_backend == 'sdpa'
+                    self.fast_transformer_backend = 'sdpa'
 
             if self.fast_transformer_backend == 'sdpa':
                 print('trying pytorch SDPA')
@@ -91,10 +92,19 @@ class PerturbationTFModel(BaseModel):
                     print(ee)
                     print('pytorch sdpa attention setup failed, falling back to native pytorch attention')
                     self.use_fast_transformer = False
-                    self.fast_transformer_backend == 'vanilla'
+                    self.fast_transformer_backend = 'vanilla'
                     encoder_layers = TransformerEncoderLayer(
                         d_model, nhead, d_hid, self.dropout, batch_first=True
                     )
+            
+            # Defensive: ensure encoder_layers is always set (handles 'vanilla' or None backend)
+            if encoder_layers is None:
+                print(f'fast_transformer_backend={self.fast_transformer_backend} — using vanilla TransformerEncoderLayer')
+                self.use_fast_transformer = False
+                self.fast_transformer_backend = 'vanilla'
+                encoder_layers = TransformerEncoderLayer(
+                    d_model, nhead, d_hid, self.dropout, batch_first=True
+                )
             self.transformer_encoder = TransformerEncoder(encoder_layers,  nlayers, enable_nested_tensor=False)
 
         
