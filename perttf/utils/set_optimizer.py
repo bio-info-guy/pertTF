@@ -1,14 +1,27 @@
 import torch
 from ..model.modules import AdversarialDiscriminator
 
-def create_optimizer_dict(model, device, config, num_batch_types = -1):
-    scaler = torch.cuda.amp.GradScaler(enabled=config.amp)
-    DAB_separate_optim = True if config.dab_weight >0 else False
 
-    # This maybe should be part of training code 
+def _get_trainable_parameters(model):
+    trainable_parameters = [
+        param for param in model.parameters() if param.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError(
+            "No trainable parameters remain after applying the freeze policy"
+        )
+    return trainable_parameters
+
+
+def create_optimizer_dict(model, device, config, num_batch_types=-1):
+    scaler = torch.cuda.amp.GradScaler(enabled=config.amp)
+    DAB_separate_optim = True if config.dab_weight > 0 else False
+    trainable_parameters = _get_trainable_parameters(model)
+
+    # This maybe should be part of training code
     if config.ADV and num_batch_types > 1:
         discriminator = AdversarialDiscriminator(
-            d_model=config.layer_size, # embsize
+            d_model=config.layer_size,  # embsize
             n_cls=num_batch_types,
         ).to(device)
         print(discriminator)
@@ -16,12 +29,14 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1):
         discriminator = None
 
     optimizer = torch.optim.Adam(
-        model.parameters(), lr=config.lr, eps=1e-4 if config.amp else 1e-8
+        trainable_parameters, lr=config.lr, eps=1e-4 if config.amp else 1e-8
     )
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=config.schedule_ratio)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, 1, gamma=config.schedule_ratio
+    )
 
     if DAB_separate_optim:
-        optimizer_dab = torch.optim.Adam(model.parameters(), lr=config.lr)
+        optimizer_dab = torch.optim.Adam(trainable_parameters, lr=config.lr)
         scheduler_dab = torch.optim.lr_scheduler.StepLR(
             optimizer_dab, config.schedule_interval, gamma=config.schedule_ratio
         )
@@ -30,7 +45,7 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1):
         scheduler_dab = None
 
     if config.ADV:
-        optimizer_E = torch.optim.Adam(model.parameters(), lr=config.lr_ADV)
+        optimizer_E = torch.optim.Adam(trainable_parameters, lr=config.lr_ADV)
         scheduler_E = torch.optim.lr_scheduler.StepLR(
             optimizer_E, config.schedule_interval, gamma=config.schedule_ratio
         )
@@ -44,7 +59,7 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1):
         optimizer_D = None
         scheduler_D = None
 
-    optimizer_dict={
+    optimizer_dict = {
         "scaler": scaler,
         "discriminator": discriminator,
         "optimizer": optimizer,
@@ -55,6 +70,6 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1):
         "scheduler_E": scheduler_E,
         "optimizer_D": optimizer_D,
         "scheduler_D": scheduler_D,
-        'DAB_separate_optim': DAB_separate_optim
+        "DAB_separate_optim": DAB_separate_optim,
     }
     return optimizer_dict
