@@ -165,6 +165,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             "flow_time_embedding_dim",
             "flow_hidden_dim",
             "flow_num_layers",
+            "flow_conditioning_mode",
+            "flow_inference_backend",
             "flow_ode_solver",
             "flow_ode_steps",
             "flow_train_next_latent_source",
@@ -222,6 +224,12 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             ),
             flow_hidden_dim=self._hub_mixin_config.get("flow_hidden_dim", None),
             flow_num_layers=self._hub_mixin_config.get("flow_num_layers", 3),
+            flow_conditioning_mode=self._hub_mixin_config.get(
+                "flow_conditioning_mode", "concat"
+            ),
+            flow_inference_backend=self._hub_mixin_config.get(
+                "flow_inference_backend", "native"
+            ),
             flow_ode_solver=self._hub_mixin_config.get("flow_ode_solver", "midpoint"),
             flow_ode_steps=self._hub_mixin_config.get("flow_ode_steps", 8),
             flow_train_next_latent_source=self._hub_mixin_config.get(
@@ -646,6 +654,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             "distribution": None,
             "use_ot": False,
             "dataset_name": "adata",
+            "flow_conditioning_mode": "concat",
+            "flow_inference_backend": "native",
             "flow_train_next_latent_source": "endpoint",
             "flow_training_rollout_policy": "off",
         }

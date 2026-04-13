@@ -7,6 +7,11 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.attention import SDPBackend
 
+try:
+    from torchdiffeq import odeint as torchdiffeq_odeint
+except ImportError:
+    torchdiffeq_odeint = None
+
 # Try to import the MHA module from flash-attn v2
 FLASH_ATTENTION_VERSION = None
 flash_attn_qkvpacked_func = None
@@ -753,6 +758,86 @@ class FlowTimeEmbedding(nn.Module):
         return self.proj(emb)
 
 
+class FlowAdaLNBlock(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        conditioning_dim: int,
+        use_residual: bool,
+    ):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, output_dim)
+        self.modulation = nn.Linear(conditioning_dim, output_dim * 3)
+        self.use_residual = use_residual and input_dim == output_dim
+
+    def forward(self, hidden: Tensor, conditioning: Tensor) -> Tensor:
+        residual = hidden
+        hidden = self.linear(hidden)
+        hidden = F.silu(hidden)
+        shift, scale, gate = self.modulation(conditioning).chunk(3, dim=1)
+        hidden = hidden * (1 + scale) + shift
+        hidden = torch.sigmoid(gate) * hidden
+        if self.use_residual:
+            hidden = residual + hidden
+        return hidden
+
+
+class FlowAdaLNVelocityNet(nn.Module):
+    def __init__(
+        self,
+        state_dim: int,
+        conditioning_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        num_layers: int,
+    ):
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+
+        blocks = []
+        if num_layers == 1:
+            blocks.append(
+                FlowAdaLNBlock(
+                    state_dim,
+                    output_dim,
+                    conditioning_dim,
+                    use_residual=False,
+                )
+            )
+            self.output_proj = None
+        else:
+            blocks.append(
+                FlowAdaLNBlock(
+                    state_dim,
+                    hidden_dim,
+                    conditioning_dim,
+                    use_residual=False,
+                )
+            )
+            for _ in range(num_layers - 2):
+                blocks.append(
+                    FlowAdaLNBlock(
+                        hidden_dim,
+                        hidden_dim,
+                        conditioning_dim,
+                        use_residual=True,
+                    )
+                )
+            self.output_proj = nn.Linear(hidden_dim, output_dim)
+
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, state_t: Tensor, conditioning: Tensor) -> Tensor:
+        hidden = state_t
+        for block in self.blocks:
+            hidden = block(hidden, conditioning)
+        if self.output_proj is not None:
+            hidden = self.output_proj(hidden)
+        return hidden
+
+
 class FlowPerturbationGenerator(nn.Module):
     def __init__(
         self,
@@ -765,6 +850,7 @@ class FlowPerturbationGenerator(nn.Module):
         time_embedding_dim: int = 64,
         hidden_dim: Optional[int] = None,
         num_layers: int = 3,
+        conditioning_mode: str = "concat",
         ode_solver: str = "euler",
         ode_steps: int = 8,
     ):
@@ -778,6 +864,7 @@ class FlowPerturbationGenerator(nn.Module):
         self.time_embedding_dim = time_embedding_dim
         self.hidden_dim = d_model if hidden_dim is None else hidden_dim
         self.num_layers = num_layers
+        self.conditioning_mode = conditioning_mode
         self.ode_solver = ode_solver
         self.ode_steps = ode_steps
 
@@ -787,7 +874,11 @@ class FlowPerturbationGenerator(nn.Module):
             raise ValueError(f"Unsupported state_mode: {self.state_mode}")
         if self.noise_mode not in {"deterministic", "gaussian"}:
             raise ValueError(f"Unsupported noise_mode: {self.noise_mode}")
-        if self.ode_solver not in {"euler", "midpoint"}:
+        if self.conditioning_mode not in {"concat", "adaln"}:
+            raise ValueError(
+                f"Unsupported flow conditioning mode: {self.conditioning_mode}"
+            )
+        if self.ode_solver not in {"euler", "midpoint", "rk4"}:
             raise ValueError(f"Unsupported flow ODE solver: {self.ode_solver}")
         if self.num_layers < 1:
             raise ValueError(f"num_layers must be >= 1, got {self.num_layers}")
@@ -804,15 +895,23 @@ class FlowPerturbationGenerator(nn.Module):
         else:
             self.anchor_mlp = None
 
-        velocity_in_dim = (
-            self.d_model + self.d_model + self.pert_dim + self.time_embedding_dim
-        )
-        self.velocity_net = self._build_mlp(
-            input_dim=velocity_in_dim,
-            hidden_dim=self.hidden_dim,
-            output_dim=self.d_model,
-            num_layers=self.num_layers,
-        )
+        conditioning_dim = self.d_model + self.pert_dim + self.time_embedding_dim
+        if self.conditioning_mode == "adaln":
+            self.velocity_net = FlowAdaLNVelocityNet(
+                state_dim=self.d_model,
+                conditioning_dim=conditioning_dim,
+                hidden_dim=self.hidden_dim,
+                output_dim=self.d_model,
+                num_layers=self.num_layers,
+            )
+        else:
+            velocity_in_dim = self.d_model + conditioning_dim
+            self.velocity_net = self._build_mlp(
+                input_dim=velocity_in_dim,
+                hidden_dim=self.hidden_dim,
+                output_dim=self.d_model,
+                num_layers=self.num_layers,
+            )
 
     @staticmethod
     def _build_mlp(
@@ -905,8 +1004,90 @@ class FlowPerturbationGenerator(nn.Module):
     ) -> Tensor:
         t = self._normalize_time(t, state_t.shape[0], state_t.device, state_t.dtype)
         t_emb = self.time_encoder(t)
-        velocity_input = torch.cat([state_t, source_latent, pert_emb, t_emb], dim=1)
+        conditioning = torch.cat([source_latent, pert_emb, t_emb], dim=1)
+        if self.conditioning_mode == "adaln":
+            return self.velocity_net(state_t, conditioning)
+        velocity_input = torch.cat([state_t, conditioning], dim=1)
         return self.velocity_net(velocity_input)
+
+    @staticmethod
+    def _validate_inference_backend(inference_backend: str) -> None:
+        if inference_backend not in {"native", "torchdiffeq"}:
+            raise ValueError(f"Unsupported flow inference backend: {inference_backend}")
+
+    @staticmethod
+    def _validate_native_solver(solver: str) -> None:
+        if solver not in {"euler", "midpoint"}:
+            raise ValueError(
+                f"Unsupported native flow ODE solver: {solver}. "
+                "Use euler|midpoint for native or switch to flow_inference_backend=torchdiffeq."
+            )
+
+    @staticmethod
+    def _validate_torchdiffeq_solver(solver: str) -> None:
+        if solver not in {"euler", "midpoint", "rk4"}:
+            raise ValueError(
+                f"Unsupported torchdiffeq flow ODE solver: {solver}. "
+                "Use euler|midpoint|rk4."
+            )
+
+    def _native_rollout(
+        self,
+        source_latent: Tensor,
+        pert_emb: Tensor,
+        reference_latent: Tensor,
+        state: Tensor,
+        steps: int,
+        solver: str,
+    ) -> Tensor:
+        self._validate_native_solver(solver)
+        dt = 1.0 / steps
+
+        for step_idx in range(steps):
+            t = torch.full(
+                (source_latent.shape[0], 1),
+                step_idx / steps,
+                device=source_latent.device,
+                dtype=source_latent.dtype,
+            )
+            if solver == "midpoint":
+                k1 = self.predict_velocity(state, t, source_latent, pert_emb)
+                mid_state = state + 0.5 * dt * k1
+                mid_t = t + 0.5 * dt
+                k2 = self.predict_velocity(mid_state, mid_t, source_latent, pert_emb)
+                state = state + dt * k2
+            else:
+                velocity = self.predict_velocity(state, t, source_latent, pert_emb)
+                state = state + dt * velocity
+        return state
+
+    def _torchdiffeq_rollout(
+        self,
+        source_latent: Tensor,
+        pert_emb: Tensor,
+        state: Tensor,
+        steps: int,
+        solver: str,
+    ) -> Tensor:
+        if torchdiffeq_odeint is None:
+            raise ImportError(
+                "torchdiffeq is required for flow_inference_backend='torchdiffeq'"
+            )
+        self._validate_torchdiffeq_solver(solver)
+
+        def ode_func(t_scalar: Tensor, state_t: Tensor) -> Tensor:
+            t_batch = t_scalar.expand(source_latent.shape[0]).unsqueeze(1)
+            return self.predict_velocity(state_t, t_batch, source_latent, pert_emb)
+
+        time_grid = torch.linspace(
+            0.0,
+            1.0,
+            steps + 1,
+            device=source_latent.device,
+            dtype=source_latent.dtype,
+        )
+        state_path = torchdiffeq_odeint(ode_func, state, time_grid, method=solver)
+        return state_path[-1]
 
     def reconstruct_endpoint(
         self,
@@ -955,35 +1136,35 @@ class FlowPerturbationGenerator(nn.Module):
         noise: Optional[Tensor] = None,
         ode_steps: Optional[int] = None,
         ode_solver: Optional[str] = None,
+        inference_backend: Optional[str] = None,
         return_path: bool = False,
     ) -> Union[Tensor, Dict[str, Tensor]]:
         solver = self.ode_solver if ode_solver is None else ode_solver
         steps = self.ode_steps if ode_steps is None else ode_steps
-        if solver not in {"euler", "midpoint"}:
-            raise ValueError(f"Unsupported flow ODE solver: {solver}")
+        backend = "native" if inference_backend is None else inference_backend
+        self._validate_inference_backend(backend)
         if steps < 1:
             raise ValueError(f"ode_steps must be >= 1, got {steps}")
 
         reference_latent = self.get_reference_latent(source_latent, pert_emb)
         state = self.get_initial_state(reference_latent, noise=noise)
-        dt = 1.0 / steps
-
-        for step_idx in range(steps):
-            t = torch.full(
-                (source_latent.shape[0], 1),
-                step_idx / steps,
-                device=source_latent.device,
-                dtype=source_latent.dtype,
+        if backend == "torchdiffeq":
+            state = self._torchdiffeq_rollout(
+                source_latent=source_latent,
+                pert_emb=pert_emb,
+                state=state,
+                steps=steps,
+                solver=solver,
             )
-            if solver == "midpoint":
-                k1 = self.predict_velocity(state, t, source_latent, pert_emb)
-                mid_state = state + 0.5 * dt * k1
-                mid_t = t + 0.5 * dt
-                k2 = self.predict_velocity(mid_state, mid_t, source_latent, pert_emb)
-                state = state + dt * k2
-            else:
-                velocity = self.predict_velocity(state, t, source_latent, pert_emb)
-                state = state + dt * velocity
+        else:
+            state = self._native_rollout(
+                source_latent=source_latent,
+                pert_emb=pert_emb,
+                reference_latent=reference_latent,
+                state=state,
+                steps=steps,
+                solver=solver,
+            )
 
         latent = self.state_to_latent(state, reference_latent)
         if not return_path:
@@ -992,6 +1173,9 @@ class FlowPerturbationGenerator(nn.Module):
             "reference_latent": reference_latent,
             "state_final": state,
             "latent_final": latent,
+            "backend": backend,
+            "solver": solver,
+            "steps": steps,
         }
 
     def forward(
@@ -1001,6 +1185,7 @@ class FlowPerturbationGenerator(nn.Module):
         noise: Optional[Tensor] = None,
         ode_steps: Optional[int] = None,
         ode_solver: Optional[str] = None,
+        inference_backend: Optional[str] = None,
         return_path: bool = False,
     ) -> Union[Tensor, Dict[str, Tensor]]:
         return self.rollout(
@@ -1009,6 +1194,7 @@ class FlowPerturbationGenerator(nn.Module):
             noise=noise,
             ode_steps=ode_steps,
             ode_solver=ode_solver,
+            inference_backend=inference_backend,
             return_path=return_path,
         )
 

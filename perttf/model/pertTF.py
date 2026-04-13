@@ -46,6 +46,8 @@ class PerturbationTFModel(BaseModel):
         self.flow_time_embedding_dim = kwargs.pop("flow_time_embedding_dim", 64)
         self.flow_hidden_dim = kwargs.pop("flow_hidden_dim", None)
         self.flow_num_layers = kwargs.pop("flow_num_layers", 3)
+        self.flow_conditioning_mode = kwargs.pop("flow_conditioning_mode", "concat")
+        self.flow_inference_backend = kwargs.pop("flow_inference_backend", "native")
         self.flow_ode_solver = kwargs.pop("flow_ode_solver", "midpoint")
         self.flow_ode_steps = kwargs.pop("flow_ode_steps", 8)
         self.flow_train_next_latent_source = kwargs.pop(
@@ -76,6 +78,7 @@ class PerturbationTFModel(BaseModel):
                 time_embedding_dim=self.flow_time_embedding_dim,
                 hidden_dim=self.flow_hidden_dim,
                 num_layers=self.flow_num_layers,
+                conditioning_mode=self.flow_conditioning_mode,
                 ode_solver=self.flow_ode_solver,
                 ode_steps=self.flow_ode_steps,
             )
@@ -224,6 +227,7 @@ class PerturbationTFModel(BaseModel):
         self,
         cell_emb_orig: Tensor,
         pert_emb_next: Tensor,
+        for_inference: bool = False,
         flow_noise: Optional[Tensor] = None,
         return_flow_dict: bool = False,
     ):
@@ -236,12 +240,16 @@ class PerturbationTFModel(BaseModel):
         )
         flow_dict = None
         if self._flow_matching_is_active():
+            inference_backend = self._resolve_flow_inference_backend(
+                for_inference=for_inference
+            )
             flow_output = self.flow_perturbation_generator(
                 source_latent=cell_emb_orig,
                 pert_emb=pert_emb_next,
                 noise=flow_noise,
                 ode_steps=self.flow_ode_steps,
                 ode_solver=self.flow_ode_solver,
+                inference_backend=inference_backend,
                 return_path=return_flow_dict,
             )
             if return_flow_dict:
@@ -260,6 +268,17 @@ class PerturbationTFModel(BaseModel):
             getattr(self, "flow_matching_active", self.flow_matching)
             and self.flow_perturbation_generator is not None
         )
+
+    def _resolve_flow_inference_backend(self, for_inference: bool = False) -> str:
+        if not for_inference:
+            return "native"
+        backend = getattr(self, "flow_inference_backend", "native")
+        if backend not in {"native", "torchdiffeq"}:
+            raise ValueError(
+                "flow_inference_backend must be 'native' or 'torchdiffeq', "
+                f"got {backend!r}"
+            )
+        return backend
 
     def _encode_detached_target_latent(
         self,
@@ -537,6 +556,7 @@ class PerturbationTFModel(BaseModel):
                     self._generate_next_cell_embedding(
                         cell_emb_orig=cell_emb_orig,
                         pert_emb_next=pert_emb_next,
+                        for_inference=not self.training,
                         return_flow_dict=True,
                     )
                 )
@@ -782,6 +802,7 @@ class PerturbationTFModel(BaseModel):
                 cell_emb_next, tf_concat = self._generate_next_cell_embedding(
                     cell_emb_orig=cell_emb,
                     pert_emb_next=pert_emb_next,
+                    for_inference=True,
                 )
                 if output_to_cpu:
                     cell_emb_next_cpu = cell_emb_next.cpu()
