@@ -689,6 +689,7 @@ def eval_testdata(
     mvc_full_expr = False,
     sizefactor = False,
     sample = False,
+    sample_seed = None,
     device = None,
 ) -> AnnData:
     """
@@ -769,6 +770,7 @@ def eval_testdata(
         predict_expr=predict_expr,
         use_full_mvc_src=mvc_full_expr,
         use_size_factor=sizefactor,
+        sample_seed=sample_seed,
     )
     outputs = result["outputs"]
     if not outputs:

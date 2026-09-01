@@ -12,50 +12,9 @@ from ..utils.custom_tokenizer import SimpleVocab
 
 
 def legacy_vocab_loading(vocab_path):
-    if vocab_path:
-        import sys
-        import types
-        from pertTF.perttf.utils.custom_tokenizer import SimpleVocab  # Import your ACTUAL class
-
-        # Define the legacy path that the file is looking for
-        # (Based on your error: "No module named perttf")
-        legacy_root = "perttf"
-        legacy_full = "perttf.utils.custom_tokenizer"
-
-        # 1. Create fake modules
-        # We create the root 'perttf'
-        fake_perttf = types.ModuleType(legacy_root)
-        # We create 'perttf.utils'
-        fake_utils = types.ModuleType(f"{legacy_root}.utils")
-        # We create 'perttf.utils.custom_tokenizer'
-        fake_tokenizer_mod = types.ModuleType(legacy_full)
-
-        # 2. Link them together (so perttf.utils works)
-        fake_perttf.utils = fake_utils
-        fake_utils.custom_tokenizer = fake_tokenizer_mod
-
-        # 3. PLANT YOUR CLASS inside the fake module
-        # When pickle asks for 'SimpleVocab' from this module, it gets your class
-        fake_tokenizer_mod.SimpleVocab = SimpleVocab
-
-        # 4. Inject into sys.modules
-        # This makes them "visible" to the import system
-        sys.modules[legacy_root] = fake_perttf
-        sys.modules[f"{legacy_root}.utils"] = fake_utils
-        sys.modules[legacy_full] = fake_tokenizer_mod
-
-        try:
-            # 5. Load the file
-            vocab_obj = torch.load(vocab_path, weights_only=False)
-        except Exception as e:
-            print(f"Error forcing vocab load: {e}")
-        finally:
-            # 6. Cleanup (Optional but recommended)
-            # Remove the fake modules so they don't confuse the rest of your app
-            if legacy_root in sys.modules: del sys.modules[legacy_root]
-            if f"{legacy_root}.utils" in sys.modules: del sys.modules[f"{legacy_root}.utils"]
-            if legacy_full in sys.modules: del sys.modules[legacy_full]
-    return vocab_obj
+    if not vocab_path:
+        return None
+    return torch.load(vocab_path, weights_only=False)
 
 
 class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
@@ -122,7 +81,6 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             
         if 'ps_names' in kwargs:
             self.ps_names = kwargs.pop('ps_names')
-            self._hub_mixin_config['n_ps'] = len(self.ps_names)
 
         # Optional perturbation FEATURE matrix (n_pert, feat_dim). Like the other
         # running params it is a tensor/array (not JSON-serializable), so it is kept
@@ -259,8 +217,132 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             with open(os.path.join(save_directory, "training_config.json"), "w") as f:
                 json.dump(final_train_config, f, indent=2)
 
+    @property
+    def prediction_scale(self) -> str:
+        """Native scale returned by the expression distribution generator."""
+        distribution = getattr(self, "distribution", None)
+        return "log1p" if distribution in {None, "zig", "gaussian"} else "counts"
+
+    def predict_perturbations(
+        self,
+        adata,
+        *,
+        input_layer: str = "X_binned",
+        perturbation_col: str = "genotype_next",
+        prediction_mode: str = "sample",
+        prediction_seed: Optional[int] = 0,
+        gene_sampling_mode: Optional[str] = None,
+        max_seq_len: Optional[int] = None,
+        use_size_factor: bool = True,
+        device: Optional[Union[str, torch.device]] = None,
+    ):
+        """Predict row-level perturbations already assigned in an AnnData object."""
+        from .train_function import eval_testdata
+
+        if prediction_mode not in {"mean", "sample"}:
+            raise ValueError("prediction_mode must be 'mean' or 'sample'")
+        if input_layer not in adata.layers:
+            raise ValueError(f"AnnData is missing expression layer {input_layer!r}")
+        required_obs = {"celltype", "genotype", perturbation_col}
+        missing_obs = required_obs.difference(adata.obs.columns)
+        if missing_obs:
+            raise ValueError(f"AnnData is missing required obs columns: {sorted(missing_obs)}")
+        if not adata.var_names.is_unique:
+            raise ValueError("AnnData var_names must be unique")
+        if getattr(self, "vocab", None) is None:
+            raise RuntimeError("Loaded model does not contain a gene vocabulary")
+        if not hasattr(self, "genotype_to_index"):
+            raise RuntimeError("Loaded model does not contain genotype_to_index")
+        if not hasattr(self, "cell_type_to_index"):
+            raise RuntimeError("Loaded model does not contain cell_type_to_index")
+
+        for column, mapping in (
+            ("celltype", self.cell_type_to_index),
+            ("genotype", self.genotype_to_index),
+        ):
+            values = adata.obs[column]
+            if values.isna().any():
+                raise ValueError(f"AnnData obs[{column!r}] contains missing values")
+            missing_labels = sorted(set(values).difference(mapping))
+            if missing_labels:
+                raise ValueError(
+                    f"AnnData obs[{column!r}] contains labels absent from the model mapping: "
+                    f"{missing_labels[:10]}"
+                )
+        missing_genes = [gene for gene in adata.var_names if gene not in self.vocab.stoi]
+        if missing_genes:
+            preview = ", ".join(map(str, missing_genes[:10]))
+            raise ValueError(
+                f"{len(missing_genes)} inference genes are absent from the model vocabulary: {preview}"
+            )
+        perturbations = adata.obs[perturbation_col]
+        if perturbations.isna().any():
+            raise ValueError(f"AnnData obs[{perturbation_col!r}] contains missing values")
+        missing_perturbations = sorted(
+            set(perturbations).difference(self.genotype_to_index)
+        )
+        if missing_perturbations:
+            raise ValueError(
+                "Inference perturbations are absent from genotype_to_index: "
+                f"{missing_perturbations[:10]}"
+            )
+
+        config = self._init_default_train_config_()
+        if "vocab" in config:
+            del config["vocab"]
+        config.next_cell_pred_type = "pert"
+        if gene_sampling_mode is not None:
+            if gene_sampling_mode not in {"simple", "expressed", "hvg"}:
+                raise ValueError("gene_sampling_mode must be 'simple', 'expressed', or 'hvg'")
+            config.sampling_mode = gene_sampling_mode
+        if max_seq_len is not None:
+            config.max_seq_len = int(max_seq_len)
+
+        if device is None:
+            device = next(self.parameters()).device
+        device = torch.device(device)
+        self.to(device)
+        self.eval()
+        result = eval_testdata(
+            self,
+            adata,
+            list(adata.var_names),
+            {
+                "cell_type_to_index": self.cell_type_to_index,
+                "genotype_to_index": self.genotype_to_index,
+                "vocab": self.vocab,
+            },
+            config,
+            input_layer_key=input_layer,
+            make_plots=False,
+            predict_expr=True,
+            mvc_full_expr=True,
+            sizefactor=use_size_factor,
+            sample=prediction_mode == "sample",
+            sample_seed=prediction_seed,
+            device=device,
+        )
+        native = result.obsm.get("mvc_next_expr")
+        if native is None or native.shape != result.shape:
+            raise RuntimeError(
+                "pertTF inference did not return mvc_next_expr aligned to the requested genes"
+            )
+        result.uns["perttf_prediction"] = {
+            "distribution": getattr(self, "distribution", None),
+            "native_scale": self.prediction_scale,
+            "input_layer": input_layer,
+            "perturbation_col": perturbation_col,
+            "prediction_mode": prediction_mode,
+            "prediction_seed": prediction_seed,
+            "gene_sampling_mode": str(config.sampling_mode),
+            "max_seq_len": int(config.max_seq_len),
+        }
+        return result
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
+        strict = kwargs.pop("strict", True)
+
         def fetch_file(filename):
             if os.path.isdir(pretrained_model_name_or_path):
                 file_path = os.path.join(pretrained_model_name_or_path, filename)
@@ -304,6 +386,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                        
         user_vocab = kwargs.get('vocab', None)
         if user_vocab is not None:
+            if strict and old_vocab_obj is not None and user_vocab.to_dict() != old_vocab_obj.to_dict():
+                raise ValueError("strict loading does not allow replacing the checkpoint vocabulary")
             vocab_merge = kwargs.pop('vocab_merge', 'custom')
             print(f'WARNING: user provide custom vocab, this is okay for finetuning, take the {vocab_merge} vocab')
             if vocab_merge == 'custom' or old_vocab_obj is None:
@@ -335,28 +419,42 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         # 5. Merge Parameters (Kwargs > RunningParams > Defaults)
         # Note: Fixed the 'kwargs(p_name)' syntax error here
         for p_name in ['genotype_to_index', 'cell_type_to_index']:
-            if kwargs.get(p_name, False):
+            if kwargs.get(p_name, None) is not None:
+                if strict and p_name in running_params and kwargs[p_name] != running_params[p_name]:
+                    raise ValueError(f"strict loading does not allow replacing {p_name}")
                 print(f'WARNING: {p_name} provided by user, {p_name} related layers may be different from pretrained model, this is okay for finetuning')
                 config[p_name] = kwargs[p_name]
             elif p_name in running_params:
                 config[p_name] = running_params[p_name]
             # else: defaults handled by __init__ or logic below
 
-        if kwargs.get('num_batch_labels', False) and type(kwargs.get('num_batch_labels', False)) == int:
+        if kwargs.get('num_batch_labels', None) is not None and type(kwargs['num_batch_labels']) == int:
+            if strict and 'num_batch_labels' in running_params and kwargs['num_batch_labels'] != running_params['num_batch_labels']:
+                raise ValueError("strict loading does not allow replacing num_batch_labels")
             config['num_batch_labels'] = kwargs['num_batch_labels']
             print(f'WARNING: num_batch_labels provided by user, batch removal head may be different from pretrained model, this is okay for finetuning')
         elif 'num_batch_labels' in running_params:
             config['num_batch_labels'] = running_params['num_batch_labels']
             
-        if kwargs.get('ps_names', False):
+        if kwargs.get('ps_names', None) is not None:
+            if strict and 'ps_names' in running_params and kwargs['ps_names'] != running_params['ps_names']:
+                raise ValueError("strict loading does not allow replacing ps_names")
             config['ps_names'] = kwargs['ps_names']
             print(f'WARNING: ps column names provided by user, ps score prediction head may be different from pretrained model, this is okay for finetuning')
         elif 'ps_names' in running_params:
             config['ps_names'] = running_params['ps_names']
 
+        # Legacy runs always recorded a placeholder PS name, including models
+        # trained with ps_weight=0 and therefore no PS decoder parameters.
+        if 'n_ps' not in config:
+            config['n_ps'] = len(config.get('ps_names', [])) if config.get('ps_weight', 0) > 0 else 0
+
         # Restore the perturbation feature matrix so the parent builds a
         # FeaturePertEncoder before weights are loaded (zero-shot encoder).
         if kwargs.get('pert_features', None) is not None:
+            if strict and running_params.get('pert_features', None) is not None:
+                if not torch.equal(torch.as_tensor(kwargs['pert_features']), torch.as_tensor(running_params['pert_features'])):
+                    raise ValueError("strict loading does not allow replacing pert_features")
             config['pert_features'] = kwargs['pert_features']
             print(f'WARNING: pert_features provided by user, perturbation encoder may be different from pretrained model, this is okay for finetuning')
         elif running_params.get('pert_features', None) is not None:
@@ -375,6 +473,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         model = cls(**config)
 
         # 7. Load Weights
+        state_dict = None
         model_path = fetch_file("model.safetensors")
         if model_path:
             from safetensors.torch import load_file
@@ -384,8 +483,14 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             if bin_path:
                 state_dict = torch.load(bin_path, weights_only=True, map_location=torch.device('cpu'))
                 
-        if state_dict is not None:
-            # CALL THE REFACTORED WORKER FUNCTION
+        if state_dict is None:
+            raise EnvironmentError(
+                f"model.safetensors or best_model.pt not found in {pretrained_model_name_or_path}"
+            )
+
+        if strict:
+            loaded_layers = cls._strict_load_weights(model, state_dict)
+        else:
             loaded_layers = cls._smart_load_weights(
                 model=model,
                 state_dict=state_dict,
@@ -394,11 +499,40 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             )
             
             # Store the list of loaded layers in the model for freezing later
-            model._loaded_layer_names = loaded_layers
+        model._loaded_layer_names = loaded_layers
             
-            print(f"Model loaded. {len(loaded_layers)} layers transferred.")
+        print(f"Model loaded. {len(loaded_layers)} layers transferred.")
 
         return model
+
+    @staticmethod
+    def _strict_load_weights(model, state_dict):
+        """Load every checkpoint tensor after deterministic attention-key remapping."""
+        model_keys = set(model.state_dict())
+        remappings = (
+            ("self_attn.in_proj_weight", "qkv_proj.weight"),
+            ("self_attn.in_proj_bias", "qkv_proj.bias"),
+            ("self_attn.out_proj.", "out_proj."),
+        )
+        remapped = {}
+        for key, value in state_dict.items():
+            target_key = key
+            if target_key not in model_keys:
+                for left, right in remappings:
+                    candidate = None
+                    if left in key:
+                        candidate = key.replace(left, right)
+                    elif right in key:
+                        candidate = key.replace(right, left)
+                    if candidate in model_keys:
+                        target_key = candidate
+                        break
+            if target_key in remapped:
+                raise RuntimeError(f"Multiple checkpoint tensors map to {target_key}")
+            remapped[target_key] = value
+
+        model.load_state_dict(remapped, strict=True)
+        return list(remapped)
     
     @staticmethod
     def _smart_load_weights(model, state_dict, old_vocab, new_vocab):
@@ -545,6 +679,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             "special_tokens": ["<pad>", "<cls>", "<eos>", "<unk>"],
             "n_bins": getattr(self, "n_input_bins", 51) or 51,
             "n_hvg": 3000,
+            "max_seq_len": 3000,
             "sampling_mode": "simple",
             "append_cls": True,
             "include_zero_gene": True,
