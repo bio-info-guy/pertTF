@@ -82,7 +82,7 @@ class PerturbationTFModel(BaseModel):
                 except Exception as e:
                     print(e)
                     print('DAO flash attention setup failed')
-                    self.fast_transformer_backend == 'sdpa'
+                    self.fast_transformer_backend = 'sdpa'
 
             if self.fast_transformer_backend == 'sdpa':
                 print('trying pytorch SDPA')
@@ -100,7 +100,7 @@ class PerturbationTFModel(BaseModel):
                     print(ee)
                     print('pytorch sdpa attention setup failed, falling back to native pytorch attention')
                     self.use_fast_transformer = False
-                    self.fast_transformer_backend == 'vanilla'
+                    self.fast_transformer_backend = 'vanilla'
                     encoder_layers = TransformerEncoderLayer(
                         d_model, nhead, d_hid, self.dropout, batch_first=True
                     )
