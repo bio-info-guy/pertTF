@@ -54,6 +54,11 @@ class FlashTransformerEncoderLayerVarlen(nn.Module):
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+        if FLASH_ATTENTION_VERSION is None:
+            raise ImportError(
+                "FlashTransformerEncoderLayerVarlen requires flash-attn (v2: 'flash_attn', v3: 'flash_attn_interface'), "
+                "but neither could be imported. Install flash-attn or use fast_transformer_backend='sdpa'."
+            )
         self.flash_version = FLASH_ATTENTION_VERSION
         self.d_model = d_model
         self.nhead = nhead
