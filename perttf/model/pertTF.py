@@ -119,7 +119,7 @@ class PerturbationTFModel(BaseModel):
                 d_model,
                 1,
                 nlayers = ps_decoder2_nlayer,
-                geneinput = self.pert_dim if self.pert_dim is not None else 0,
+                geneinput = pert_dim,  # must match pert_encoder output width (d_model when pert_dim is None)
             )
         else:
             self.ps_decoder2 = None
