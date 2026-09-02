@@ -725,6 +725,11 @@ def eval_testdata(
         hvg_inds = (np.where(adata_t.var[hvg_col])[0], np.where(~adata_t.var[hvg_col])[0])
         max_seq_len = int(adata_t.var[hvg_col].sum()) + _cfg(config, "non_hvg_size", 1000)
     collator_config = dict(config)
+    # Drop keys that collide with PertBatchCollator's named parameters. Older
+    # checkpoints store "vocab": null in training_config.json, which would
+    # otherwise be passed twice (positionally and via **collator_config).
+    for key in ("vocab", "gene_ids", "hvg_inds", "full_tokenize"):
+        collator_config.pop(key, None)
     collator_config.update({
         "max_seq_len": max_seq_len,
         "deterministic": True,
