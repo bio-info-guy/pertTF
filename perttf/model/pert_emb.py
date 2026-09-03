@@ -170,18 +170,21 @@ def load_pert_embeddings(
     }
 
 
-def generate_pert_embeddings(adata_target, adata_wt, candidate_genes,
+def generate_pert_embeddings(adata_src, adata_tg, candidate_genes,
                              model, gene_ids, cell_type_to_index, genotype_to_index, vocab,
                              config, device,
                              n_expands_per_epoch = 50,
                              n_epoch = 4,
                              wt_pred_next_label = "WT", ):
     """
-    Generate perturbation embeddings for target cells, and calculate cosine similarity between all target cells vs wild-type cells
+    Generate perturbation embeddings for simulated perturbations from source cells, and calculate cosine similarity between (source -> perturb) cells vs target cells.
+    Source cells will undergo pertTF for simulated perturbation (source -> perturb), while target cells will also undergo the same pipeline for perturbation, 
+    but should have the same label as the target cell (defined in wt_pred_next_label).
+    For example, if your target cells are wild-type (unperturbed) cells, then the wt_pred_next_label should set to "WT" (default).
 
     Args:
-      adata_target: AnnData object of the target cells, where the perturbation will be based on (this is the "source" of the perturbation).
-      adata_wt: AnnData object of the wildtype cells. This is considered as the "target" of the perturbation 
+      adata_src: AnnData object of the source cells, where the perturbation will be based on (this is the "source" of the perturbation).
+      adata_tg: AnnData object of the target cells. This is considered as the "target" of the perturbation 
       candidate_genes: List of candidate genes for perturbation.
       model: 
       gene_ids:
@@ -190,27 +193,27 @@ def generate_pert_embeddings(adata_target, adata_wt, candidate_genes,
       vocab:
       config:
       device:
-      n_expands_per_epoch: the number of duplicates in adata_target to be used for perturbation simulation. For smaller number of target cells, set it to a big number
+      n_expands_per_epoch: the number of duplicates in adata_src to be used for perturbation simulation. For smaller number of target cells, set it to a big number
       n_epoch:  the number of rounds that perturbaiton prediction is performed
-      wt_pred_next_label: This should fill the "pred_next" label for adata_wt. Default WT 
+      wt_pred_next_label: This should fill the "pred_next" label for adata_tg. Default WT 
     Returns:
-      cell_emb_data_all: generated cell embeddings, a 2-d np array. Row size: (adata_target.n_obs*n_expands_per_epoch + adata_wt.n_obs)*n_epoch. Column size: (emb_size of the model)
+      cell_emb_data_all: generated cell embeddings, a 2-d np array. Row size: (adata_src.n_obs*n_expands_per_epoch + adata_tg.n_obs)*n_epoch. Column size: (emb_size of the model)
       perturb_info_all: a Pandas dataframe describing the cell information in cell_emb_data_all
-      cs_matrix_res: cosine similarity matrix, a 2-d np array. Size: adata_wt.n_obs * (adata_target.n_obs*n_expands_per_epoch) * n_epoch
+      cs_matrix_res: cosine similarity matrix, a 2-d np array. Size: adata_tg.n_obs * (adata_src.n_obs*n_expands_per_epoch) * n_epoch
       a_eva: evaluated AnnData object from the last round of evaluation
     """
     # expand
-    adata_bwmerge=sc.concat([adata_target]*n_expands_per_epoch + [adata_wt], axis=0, merge='same')
+    adata_bwmerge=sc.concat([adata_src]*n_expands_per_epoch + [adata_tg], axis=0, merge='same')
     cell_emb_data_all = None
     perturb_info_all = None
 
-    cs_matrix_res = np.zeros((adata_wt.shape[0], adata_target.shape[0] * n_expands_per_epoch, n_epoch))
+    cs_matrix_res = np.zeros((adata_tg.shape[0], adata_src.shape[0] * n_expands_per_epoch, n_epoch))
     # loop over epochs
     for n_round in range(n_epoch):
         # assign genoytpe_next
-        gt_next_1 = np.random.choice(list(candidate_genes), size = adata_target.shape[0] * n_expands_per_epoch)
+        gt_next_1 = np.random.choice(list(candidate_genes), size = adata_src.shape[0] * n_expands_per_epoch)
         #adata_test_gw_wtmerge.obs.loc[adata_test_gw_wtmerge.obs['genotype']=='WT' ,'genotype_next'].value_counts()
-        gt_next_2 = [wt_pred_next_label]*adata_wt.shape[0]
+        gt_next_2 = [wt_pred_next_label]*adata_tg.shape[0]
         gt_next = np.concatenate([gt_next_1,gt_next_2])
         adata_bwmerge.obs[ 'genotype_next'] = gt_next
 
@@ -228,7 +231,7 @@ def generate_pert_embeddings(adata_target, adata_wt, candidate_genes,
         perturb_info=a_eva.obs[['genotype','genotype_next']]
 
         perturb_info['round']=n_round
-        perturb_info['type']=['pert_source']*adata_target.shape[0]*n_expands_per_epoch + ['pert_dest']*adata_wt.shape[0]
+        perturb_info['type']=['pert_source']*adata_src.shape[0]*n_expands_per_epoch + ['pert_dest']*adata_tg.shape[0]
 
         # calculate cosine similarity
         from sklearn.metrics.pairwise import cosine_similarity
