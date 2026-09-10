@@ -224,8 +224,8 @@ def generate_pred_ps(adata_src,
   adata_src.obs['genotype_next'] = adata_src.obs['genotype_next'].cat.set_categories(new_categories)
 
   if use_wt_only:
-    adata_src.obs.loc[adata_src.obs['genotype'].isin(['WT']), 'genotype_next'] \
-        = np.random.choice(target_pred_gene_list, size = sum(adata_src.obs['genotype'].isin(['WT'])))
+    adata_src.obs.loc[adata_src.obs['genotype'].isin([wtlabel]), 'genotype_next'] \
+        = np.random.choice(target_pred_gene_list, size = sum(adata_src.obs['genotype'].isin([wtlabel])))
   else:
     adata_src.obs[ 'genotype_next'] \
     = np.random.choice(target_pred_gene_list, size = adata_src.n_obs)
