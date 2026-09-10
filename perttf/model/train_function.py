@@ -1023,7 +1023,8 @@ def wrapper_train(model, config, data_gen,
                     epoch=epoch,
                     eval_key=eval_dict_key,
                     predict_expr = predict_expr_tmp,
-                    mvc_full_expr= predict_expr_tmp
+                    mvc_full_expr= predict_expr_tmp,
+                    device=device,
                 )
                 adata_with_embeddings = results
                 

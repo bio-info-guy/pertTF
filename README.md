@@ -66,7 +66,7 @@ All these tutorials can run on Google Colab.
 
 ### Using the pertTF model
 
-- [Inference Tutorial](demos/tutorials/INFERENCE.md): use the HuggingFace pertTF model to make inferences
+- [Inference Tutorial](demos/tutorials/INFERENCE.md) and [Google Colab notebook](https://colab.research.google.com/drive/1KWWvRJJJOj9QXuF5zgddLHkdCx6KJnTa?usp=sharing): use the HuggingFace pertTF model to make inferences
 - [LoRA fine tuning tutorial](demos/tutorials/LORA_FINETUNING.md) and [python notebook](demos/tutorials/lora_finetuning_tutorial.ipynb): use LoRA to fine tune the pertTF model
 
 ### Virtual screen and modeling composition change
