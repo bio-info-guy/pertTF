@@ -689,8 +689,8 @@ def eval_testdata(
     mvc_full_expr = False,
     sizefactor = False,
     sample = False,
-    sample_seed = None,
     device = None,
+    sample_seed = None,
 ) -> AnnData:
     """
     Evaluate the model on test data and return an AnnData object with embeddings.

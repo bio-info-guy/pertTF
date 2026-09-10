@@ -241,6 +241,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
         if prediction_mode not in {"mean", "sample"}:
             raise ValueError("prediction_mode must be 'mean' or 'sample'")
+        if perturbation_col != "genotype_next":
+            raise ValueError("perturbation_col must be 'genotype_next'")
         if input_layer not in adata.layers:
             raise ValueError(f"AnnData is missing expression layer {input_layer!r}")
         required_obs = {"celltype", "genotype", perturbation_col}
@@ -322,6 +324,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             sample_seed=prediction_seed,
             device=device,
         )
+        if not result.obs_names.equals(adata.obs_names):
+            raise RuntimeError("pertTF inference did not preserve the requested rows and their order")
         native = result.obsm.get("mvc_next_expr")
         if native is None or native.shape != result.shape:
             raise RuntimeError(
