@@ -19,8 +19,11 @@ def legacy_vocab_loading(vocab_path):
 
     class VocabUnpickler(pickle.Unpickler):
         def find_class(self, module, name):
-            # Repository-namespace imports must also load installed-package vocabularies.
-            if module == "perttf.utils.custom_tokenizer" and name == "SimpleVocab":
+            # Resolve vocabularies saved through either supported import namespace.
+            if name == "SimpleVocab" and module in {
+                "perttf.utils.custom_tokenizer",
+                "pertTF.perttf.utils.custom_tokenizer",
+            }:
                 return SimpleVocab
             return super().find_class(module, name)
 
