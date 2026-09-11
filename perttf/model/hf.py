@@ -14,7 +14,20 @@ from ..utils.custom_tokenizer import SimpleVocab
 def legacy_vocab_loading(vocab_path):
     if not vocab_path:
         return None
-    return torch.load(vocab_path, weights_only=False)
+    import pickle
+    import types
+
+    class VocabUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            # Repository-namespace imports must also load installed-package vocabularies.
+            if module == "perttf.utils.custom_tokenizer" and name == "SimpleVocab":
+                return SimpleVocab
+            return super().find_class(module, name)
+
+    vocab_pickle = types.ModuleType("perttf_vocab_pickle")
+    vocab_pickle.__dict__.update(vars(pickle))
+    vocab_pickle.Unpickler = VocabUnpickler
+    return torch.load(vocab_path, weights_only=False, pickle_module=vocab_pickle)
 
 
 class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
