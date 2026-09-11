@@ -22,7 +22,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         self,
         n_pert: int = 1,
         nlayers_pert: int = 4,
-        n_ps: int = 1,
+        n_ps: Optional[int] = None,
         ntoken: int = None,
         d_model: int = 32,
         nhead: int = 4,
@@ -81,6 +81,10 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             
         if 'ps_names' in kwargs:
             self.ps_names = kwargs.pop('ps_names')
+
+        if n_ps is None:
+            n_ps = len(self.ps_names) if hasattr(self, 'ps_names') else 1
+        self._hub_mixin_config['n_ps'] = n_ps
 
         # Optional perturbation FEATURE matrix (n_pert, feat_dim). Like the other
         # running params it is a tensor/array (not JSON-serializable), so it is kept
@@ -377,6 +381,12 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
+        """Restore HF-saved inference models with strict weight loading by default.
+
+        Legacy checkpoints use constructor defaults for missing architecture
+        settings and fail if their weights do not match. Use strict=False only
+        for intentional partial weight transfer, such as fine-tuning.
+        """
         strict = kwargs.pop("strict", True)
 
         def fetch_file(filename):
