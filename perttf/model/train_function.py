@@ -691,10 +691,12 @@ def eval_testdata(
     sample = False,
     device = None,
     sample_seed = None,
+    max_seq_len = None,
 ) -> AnnData:
     """
     Evaluate the model on test data and return an AnnData object with embeddings.
     Plotting and UMAP are offloaded to a separate process.
+    An explicit max_seq_len overrides mode-specific defaults and includes CLS.
     """
     logger = create_logger() if logger is None else logger
     if device is None:
@@ -717,14 +719,17 @@ def eval_testdata(
 
     sampling_mode = _cfg(config, "sampling_mode", "simple")
     hvg_inds = None
-    max_seq_len = _cfg(config, "max_seq_len", 3000)
+    max_seq_len_override = max_seq_len
+    max_seq_len = _cfg(config, "max_seq_len", 3000) if max_seq_len is None else max_seq_len
     if sampling_mode == "expressed":
-        max_seq_len = 10000
+        if max_seq_len_override is None:
+            max_seq_len = 10000
     elif sampling_mode == "hvg":
         hvg_col = _cfg(config, "hvg_col", "highly_variable")
         assert hvg_col in adata_t.var.keys(), "adata must have calculated HVGs or adata.var must have hvg_col"
         hvg_inds = (np.where(adata_t.var[hvg_col])[0], np.where(~adata_t.var[hvg_col])[0])
-        max_seq_len = int(adata_t.var[hvg_col].sum()) + _cfg(config, "non_hvg_size", 1000)
+        if max_seq_len_override is None:
+            max_seq_len = int(adata_t.var[hvg_col].sum()) + _cfg(config, "non_hvg_size", 1000)
     collator_config = dict(config)
     # Drop the keys that the PertBatchCollator call below supplies explicitly,
     # so they are not also passed via **collator_config. Older checkpoints store

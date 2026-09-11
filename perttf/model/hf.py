@@ -236,7 +236,15 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         use_size_factor: bool = True,
         device: Optional[Union[str, torch.device]] = None,
     ):
-        """Predict row-level perturbations already assigned in an AnnData object."""
+        """Predict row-level perturbations already assigned in an AnnData object.
+
+        Simple sampling uses max_seq_len as a token limit. Expressed sampling
+        allows at least 10,000 genes, bounded by the available genes. HVG
+        sampling retains all annotated HVGs; an explicit max_seq_len above the
+        HVG count sets the total gene budget, otherwise non_hvg_size is retained.
+        Expressed and HVG budgets reserve an additional slot for the CLS token.
+        Prediction metadata records the resolved token limit.
+        """
         from .train_function import eval_testdata
 
         if prediction_mode not in {"mean", "sample"}:
@@ -298,7 +306,28 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                 raise ValueError("gene_sampling_mode must be 'simple', 'expressed', or 'hvg'")
             config.sampling_mode = gene_sampling_mode
         if max_seq_len is not None:
+            if int(max_seq_len) <= 0:
+                raise ValueError("max_seq_len must be positive")
             config.max_seq_len = int(max_seq_len)
+
+        append_cls = int(config.get("append_cls", True))
+        if config.sampling_mode == "expressed":
+            n_genes = min(adata.n_vars, max(10000, int(config.max_seq_len)))
+            config.max_seq_len = n_genes + append_cls
+        elif config.sampling_mode == "hvg":
+            hvg_col = config.get("hvg_col", "highly_variable")
+            if hvg_col not in adata.var:
+                raise ValueError(f"AnnData var is missing HVG column {hvg_col!r}")
+            n_hvg = int(adata.var[hvg_col].sum())
+            non_hvg_size = int(config.get("non_hvg_size", 1000))
+            if max_seq_len is not None and int(max_seq_len) > n_hvg:
+                non_hvg_size = int(max_seq_len) - n_hvg
+            config.non_hvg_size = min(non_hvg_size, adata.n_vars - n_hvg)
+            config.max_seq_len = n_hvg + config.non_hvg_size + append_cls
+        else:
+            config.max_seq_len = min(int(config.max_seq_len), adata.n_vars + append_cls)
+        # The inference sampling policy takes precedence over training-time full tokenization.
+        config.full_tokenize = False
 
         if device is None:
             device = next(self.parameters()).device
@@ -323,6 +352,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             sample=prediction_mode == "sample",
             sample_seed=prediction_seed,
             device=device,
+            max_seq_len=int(config.max_seq_len),
         )
         if not result.obs_names.equals(adata.obs_names):
             raise RuntimeError("pertTF inference did not preserve the requested rows and their order")
@@ -341,6 +371,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             "gene_sampling_mode": str(config.sampling_mode),
             "max_seq_len": int(config.max_seq_len),
         }
+        if config.sampling_mode == "hvg":
+            result.uns["perttf_prediction"]["non_hvg_size"] = int(config.non_hvg_size)
         return result
 
     @classmethod
@@ -451,7 +483,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         # Legacy runs always recorded a placeholder PS name, including models
         # trained with ps_weight=0 and therefore no PS decoder parameters.
         if 'n_ps' not in config:
-            config['n_ps'] = len(config.get('ps_names', [])) if config.get('ps_weight', 0) > 0 else 0
+            ps_weight = config.get('ps_weight', config.get('training_config', {}).get('ps_weight', 0))
+            config['n_ps'] = len(config.get('ps_names', [])) if ps_weight > 0 else 0
 
         # Restore the perturbation feature matrix so the parent builds a
         # FeaturePertEncoder before weights are loaded (zero-shot encoder).
