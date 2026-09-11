@@ -321,6 +321,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         if "vocab" in config:
             del config["vocab"]
         config.next_cell_pred_type = "pert"
+        config.use_batch_label = bool(self.use_batch_labels or self.domain_spec_batchnorm)
         if gene_sampling_mode is not None:
             if gene_sampling_mode not in {"simple", "expressed", "hvg"}:
                 raise ValueError("gene_sampling_mode must be 'simple', 'expressed', or 'hvg'")
@@ -502,6 +503,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             if strict and 'ps_names' in running_params and kwargs['ps_names'] != running_params['ps_names']:
                 raise ValueError("strict loading does not allow replacing ps_names")
             config['ps_names'] = kwargs['ps_names']
+            if not strict:
+                config['n_ps'] = len(kwargs['ps_names'])
             print(f'WARNING: ps column names provided by user, ps score prediction head may be different from pretrained model, this is okay for finetuning')
         elif 'ps_names' in running_params:
             config['ps_names'] = running_params['ps_names']
